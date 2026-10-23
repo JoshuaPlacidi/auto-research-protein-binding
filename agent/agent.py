@@ -179,15 +179,27 @@ class ArgonClient:
 
     def ask(self, prompt, schema, phase, experiment_id):
         tokens = self.call("count_tokens", contents=prompt).total_tokens
-        if tokens is None or tokens + 2048 > self.args.max_input_tokens:
+        if tokens is None or tokens + 2048 > self.args.max_input_tokens or tokens + 2048 + self.args.max_output_tokens > 1048576:
             raise RuntimeError("Full history exceeds input-token budget; no truncation performed")
         append_log("api_request", experiment_id=experiment_id, phase=phase,
                    input_tokens=tokens, context_sha256=source_hash(prompt),
-                   full_history_included=True, api_calls_used=self.calls)
+                   full_history_included=True, api_calls_used=self.calls,
+                   thinking_level=self.args.thinking_level, max_output_tokens=self.args.max_output_tokens)
         response = self.call("generate_content", contents=prompt, config={
             "response_mime_type": "application/json", "response_json_schema": schema,
             "max_output_tokens": self.args.max_output_tokens,
+            "thinking_config": {"thinking_level": self.args.thinking_level},
         })
+        usage = getattr(response, "usage_metadata", None)
+        finishes = [str(getattr(candidate, "finish_reason", ""))
+                    for candidate in (getattr(response, "candidates", None) or [])]
+        append_log("api_response", experiment_id=experiment_id, phase=phase,
+                   finish_reasons=finishes,
+                   token_usage={key: getattr(usage, key, None) for key in
+                                ("prompt_token_count", "candidates_token_count",
+                                 "thoughts_token_count", "total_token_count")})
+        if any("MAX_TOKENS" in reason for reason in finishes):
+            raise ValueError("Argon reached its thinking/output cap; no partial model code will be applied")
         if not response.text:
             raise ValueError("Argon returned no JSON text")
         result = json.loads(response.text)
@@ -481,11 +493,14 @@ def parse_args(argv=None):
     parser.add_argument("--run-timeout", type=float, default=900,
                         help="Seconds per training/evaluation subprocess")
     parser.add_argument("--session-timeout", type=float, default=3600)
-    parser.add_argument("--api-timeout", type=float, default=180)
+    parser.add_argument("--api-timeout", type=float, default=600)
     parser.add_argument("--max-api-calls", type=int, default=8,
                         help="Includes count_tokens; four calls per complete experiment")
-    parser.add_argument("--max-input-tokens", type=int, default=100000)
-    parser.add_argument("--max-output-tokens", type=int, default=16384)
+    parser.add_argument("--thinking-level", choices=("low", "medium", "high"), default="high")
+    parser.add_argument("--max-input-tokens", type=int, default=900000,
+                        help="Full-prompt input cap, including safety margin; never silently truncated")
+    parser.add_argument("--max-output-tokens", type=int, default=65536,
+                        help="Combined thinking and answer cap; synchronous maximum is 65536")
     parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--category-column")
     parser.add_argument("--resume", action="store_true")
@@ -495,6 +510,10 @@ def parse_args(argv=None):
                  "max_api_calls", "max_input_tokens", "max_output_tokens", "patience"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.max_output_tokens > 65536:
+        parser.error("Synchronous controller supports up to 65536 thinking/output tokens; longer decoding requires the background API")
+    if args.max_input_tokens + args.max_output_tokens > 1048576:
+        parser.error("Input and thinking/output budgets must fit the shared 1048576-token context")
     return args
 
 
