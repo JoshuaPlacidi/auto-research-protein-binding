@@ -24,6 +24,18 @@ from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
 LOG = ROOT / "experiments/evaluation.log"
+SESSION_STARTED_AT = None
+
+
+class StopRequested(Exception):
+    """A configured budget, patience limit or operator request ended the search."""
+
+
+def check_stop():
+    if SESSION_STARTED_AT is not None:
+        for record in reversed(read_records()):
+            if record.get("event") == "stop_requested" and record.get("timestamp", "") >= SESSION_STARTED_AT:
+                raise StopRequested("Operator requested a stop through the shared log")
 
 
 def append_log(event, **fields):
@@ -97,7 +109,7 @@ def inspect_environment():
 
 
 def protected_hashes(data_paths):
-    paths = [ROOT / name for name in ("eval.py", "objective.md", "agent/agent.py",
+    paths = [ROOT / name for name in ("eval.py", "final_eval.py", "objective.md", "agent/agent.py",
                                       "pyproject.toml", "uv.lock", ".env")]
     return {str(p): digest(p) for p in paths + data_paths if p.is_file()}
 
@@ -133,7 +145,10 @@ def build_context(task, data_summary, incumbent):
             "Base scientific decisions on all reported metrics and full history, not solely the lowest MSE. "
             "For investigate/discard/failed, the controller restores the incumbent; keep promotes the candidate. "
             "Investigate means record the uncertainty and propose a controlled follow-up next. "
-            "No training occurs during imports. No package installs or subprocess launches in generated ml.py."
+            "No training occurs during imports. No package installs or subprocess launches in generated ml.py. "
+            "Preserve checkpoint saving: initial_model.pth after initialisation, last_model.pth every epoch "
+            "and in a finally block, model.pth for the chosen validation checkpoint. Save atomically. "
+            "Never delete or overwrite another experiment directory or checkpoint."
         ),
     }, ensure_ascii=False)
 
@@ -150,11 +165,12 @@ class ArgonClient:
         self.client.close()
 
     def call(self, method, **kwargs):
+        check_stop()
         if self.calls >= self.args.max_api_calls:
-            raise RuntimeError("API-call budget exhausted")
+            raise StopRequested("API-call budget exhausted")
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError("Session runtime budget exhausted")
+            raise StopRequested("Session runtime budget exhausted")
         # Request-level timeout is also bounded by the remaining session time.
         kwargs.setdefault("config", {})["http_options"] = {
             "timeout": max(1, int(min(self.args.api_timeout, remaining) * 1000))}
@@ -220,20 +236,38 @@ def apply_model_change(source):
 
 
 def run_command(command, experiment_id, stage, env, timeout):
-    """Fixed argv only, no shell. Kill the process group on timeout/interruption."""
+    """Fixed argv; poll for stop requests, then allow checkpoint saving before kill."""
     start = time.monotonic()
     process = subprocess.Popen(command, cwd=ROOT, env=env, start_new_session=(os.name == "posix"))
     try:
-        code = process.wait(timeout=timeout)
-    except BaseException:
-        if os.name == "posix":
+        while True:
+            check_stop()
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        else:
-            process.kill()
-        process.wait()
+                code = process.wait(timeout=min(1.0, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        # The starter ml.py saves latest weights in finally on SIGINT. A forced
+        # SIGKILL/power failure can only retain the last successful disk save.
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGINT)
+            else:
+                process.terminate()
+            process.wait(timeout=10)
+        except (subprocess.TimeoutExpired, ProcessLookupError):
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            process.wait()
         append_log("execution", experiment_id=experiment_id, stage=stage,
                    status="interrupted_or_timeout", runtime_seconds=time.monotonic()-start)
         raise
@@ -250,8 +284,15 @@ def run_training(experiment_id, directory, args, deadline):
     directory.mkdir(parents=True, exist_ok=False)
     # Import in a fresh process and set the existing module variable explicitly.
     launcher = "import os, ml; ml.EXPERIMENT_DIR=os.environ['EXPERIMENT_DIR']; ml.main()"
-    run_command([sys.executable, "-B", "-c", launcher], experiment_id, "training", env,
-                max(0.01, min(args.run_timeout, deadline-time.monotonic())))
+    try:
+        run_command([sys.executable, "-B", "-c", launcher], experiment_id, "training", env,
+                    max(0.01, min(args.run_timeout, deadline-time.monotonic())))
+    finally:
+        # Retain checkpoints for ALL attempts, not just scientifically kept runs.
+        append_log("checkpoint_inventory", experiment_id=experiment_id,
+                   experiment_dir=str(directory),
+                   checkpoints={p.name: {"sha256": digest(p), "bytes": p.stat().st_size}
+                                for p in directory.glob("*.pth")})
     if not (directory / "model.pth").is_file():
         raise RuntimeError("Training did not produce model.pth in its assigned directory")
 
@@ -304,6 +345,8 @@ def restore_or_keep(decision, source, previous_source, incumbent, experiment_id,
 def recover_selection(resume, protocol):
     """Recover source from the single ledger; never create revision files."""
     records = read_records()
+    if any(r.get("event") == "research_finalized" for r in records):
+        raise ValueError("This history is frozen for final test evaluation; autonomous optimisation cannot resume")
     sessions = [r for r in records if r.get("event") == "session_start"]
     if sessions and not resume:
         raise ValueError("History exists: use --resume to continue it")
@@ -329,6 +372,7 @@ def recover_selection(resume, protocol):
 
 
 def _run_agent_loop(args, client_factory=ArgonClient):
+    global SESSION_STARTED_AT
     os.chdir(ROOT)
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
@@ -342,18 +386,21 @@ def _run_agent_loop(args, client_factory=ArgonClient):
     previous_source, incumbent = recover_selection(args.resume, protected)
     deadline = time.monotonic() + args.session_timeout
     session_id = uuid.uuid4().hex[:12]
+    SESSION_STARTED_AT = datetime.now(timezone.utc).isoformat()
     append_log("session_start", session_id=session_id, protocol=protected,
                initial_ml_py=previous_source, incumbent=incumbent,
                budgets=vars(args), data_summary=data_summary)
     client = None
+    no_promotion = 0
     try:
         client = client_factory(args, deadline)
         for index in range(args.max_experiments):
+            check_stop()
             if time.monotonic() >= deadline:
-                raise RuntimeError("Session runtime budget exhausted")
+                raise StopRequested("Session runtime budget exhausted")
             # Reserve count+generate for BOTH proposal and interpretation.
             if client.calls + 4 > args.max_api_calls:
-                raise RuntimeError("Insufficient API budget for a complete experiment")
+                raise StopRequested("Insufficient API budget for a complete experiment")
             assert_unchanged(protected)
             experiment_id = f"{session_id}_{index+1:04d}"
             directory = ROOT / "experiments" / experiment_id
@@ -368,22 +415,35 @@ def _run_agent_loop(args, client_factory=ArgonClient):
                 run_evaluation(experiment_id, directory, proposal, args, deadline)
                 assert_unchanged(protected)
                 valid = True
+            except StopRequested:
+                raise
             except Exception as exc:
                 append_log("experiment_failure", experiment_id=experiment_id,
                            error=f"{type(exc).__name__}: {exc}")
                 assert_unchanged(protected)
+            check_stop()
             decision = decide_next_action(client, data_summary, incumbent, experiment_id, valid)
             append_log("agent_decision", experiment_id=experiment_id, **decision)
             previous_source, incumbent = restore_or_keep(
                 decision, source, previous_source, incumbent, experiment_id, directory)
             print(f"{experiment_id}: {decision['decision']} — {decision['reason']}", flush=True)
+            no_promotion = 0 if decision["decision"] == "keep" else no_promotion + 1
+            if no_promotion >= args.patience:
+                raise StopRequested(f"Patience reached: {no_promotion} consecutive experiments without a keep decision")
         if incumbent is None:
             raise RuntimeError("No valid model was selected; inspect the shared log")
     except BaseException as exc:
         (ROOT / "ml.py").write_text(previous_source, encoding="utf-8")
         append_log("session_stopped", session_id=session_id, incumbent=incumbent,
                    error=f"{type(exc).__name__}: {exc}", api_calls_used=client.calls if client else 0)
-        raise
+        if isinstance(exc, StopRequested):
+            print(f"Search stopped: {exc}")
+            if incumbent:
+                print(f"Selected checkpoint: {incumbent['experiment_dir']}/model.pth")
+            else:
+                raise RuntimeError("Search stopped before selecting a valid model") from exc
+        else:
+            raise
     else:
         append_log("session_complete", session_id=session_id, incumbent=incumbent,
                    api_calls_used=client.calls)
@@ -392,6 +452,7 @@ def _run_agent_loop(args, client_factory=ArgonClient):
         close = getattr(client, "close", None)
         if close:
             close()
+        SESSION_STARTED_AT = None
 
 
 def run_agent_loop(args, client_factory=ArgonClient):
@@ -410,6 +471,10 @@ def run_agent_loop(args, client_factory=ArgonClient):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--request-stop", action="store_true",
+                        help="Append a manual stop request for the active controller; no API/data access")
+    parser.add_argument("--patience", type=int, default=3,
+                        help="Stop after this many consecutive discard/investigate/failed decisions")
     parser.add_argument("--model", default="gemini-4-argon")
     parser.add_argument("--max-experiments", type=int, default=2,
                         help="Total attempts this invocation, including initial baseline setup")
@@ -427,15 +492,24 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="Local data preflight only; no API/training")
     args = parser.parse_args(argv)
     for name in ("max_experiments", "run_timeout", "session_timeout", "api_timeout",
-                 "max_api_calls", "max_input_tokens", "max_output_tokens"):
+                 "max_api_calls", "max_input_tokens", "max_output_tokens", "patience"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     return args
 
 
 def main():
+    # Scheduler SIGTERM should use the same checkpoint/rollback path as Ctrl+C.
+    def terminate(signum, frame):
+        raise KeyboardInterrupt("Received SIGTERM")
+    signal.signal(signal.SIGTERM, terminate)
     try:
-        run_agent_loop(parse_args())
+        args = parse_args()
+        if args.request_stop:
+            append_log("stop_requested", reason="Operator CLI request")
+            print("Stop requested; the active controller will stop at its next checkpoint (or after its current API request).")
+            return 0
+        run_agent_loop(args)
     except KeyboardInterrupt:
         print("Interrupted; incumbent ml.py restored.", file=sys.stderr)
         return 130
