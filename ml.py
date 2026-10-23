@@ -2,16 +2,21 @@ import torch
 from dotenv import load_dotenv
 import os
 import pandas as pd
-
+from sklearn.metrics import average_precision_score, roc_auc_score
+from tqdm import tqdm
 load_dotenv()
 
 EXPERIMENT_DIR = "experiments/1/"
+
+MAX_PEPTIDE_LENGTH = 24
+MAX_HLA_LENGTH = 366
+MAX_TCR_LENGTH = 247
 
 # Dataset
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, data_path: str):
         self.data = pd.read_csv(data_path)
-        self.tokenizer = {"A": 0, "C": 1, "D": 2, "E": 3, "F": 4, "G": 5, "H": 6, "I": 7, "K": 8, "L": 9, "M": 10, "N": 11, "P": 12, "Q": 13, "R": 14, "S": 15, "T": 16, "V": 17, "W": 18, "Y": 19}
+        self.tokenizer = {"A": 1, "C": 2, "D": 3, "E": 4, "F": 5, "G": 6, "H": 7, "I": 8, "K": 9, "L": 10, "M": 11, "N": 12, "P": 13, "Q": 14, "R": 15, "S": 16, "T": 17, "V": 18, "W": 19, "Y": 20}
 
     def tokenize(self, text: str):
         return [self.tokenizer[char] for char in text]
@@ -27,6 +32,11 @@ class Dataset(torch.utils.data.Dataset):
         hla = torch.tensor(self.tokenize(x["HLA_sequence"]))
         tcr = torch.tensor(self.tokenize(x["TCR_full"]))
 
+        # pad inputs
+        peptide = torch.nn.functional.pad(peptide, (0, MAX_PEPTIDE_LENGTH - len(peptide)), mode="constant", value=0)
+        hla = torch.nn.functional.pad(hla, (0, MAX_HLA_LENGTH - len(hla)), mode="constant", value=0)
+        tcr = torch.nn.functional.pad(tcr, (0, MAX_TCR_LENGTH - len(tcr)), mode="constant", value=0)
+
         # outputs
         binding_flag = torch.tensor(x["binding_flag"])
         
@@ -34,41 +44,62 @@ class Dataset(torch.utils.data.Dataset):
 
 # Model
 class Model(torch.nn.Module):
-    def __init__(self, embedding_dim: int = 10):
+    def __init__(self, embedding_dim: int = 768):
         super(Model, self).__init__()
-        self.embedding = torch.nn.Embedding(20, 10)
-        self.fc = torch.nn.Linear(10, 1)
+        self.embedding = torch.nn.Embedding(21, embedding_dim)
+        self.fc1 = torch.nn.Linear(embedding_dim, 1)
 
     def forward(self, peptide, hla, tcr):
         peptide = self.embedding(peptide)
         hla = self.embedding(hla)
         tcr = self.embedding(tcr)
-        print(peptide.shape, hla.shape, tcr.shape)
+
         x = torch.cat([peptide, hla, tcr], dim=1)
-        print(x.shape)
-        x = self.fc(x)
-        print(x.shape)
-        input()
-        return torch.tensor(0).to(peptide.device)
+        x = x.mean(dim=1)
+        x = self.fc1(x)
+        x = torch.sigmoid(x)
+
+        return x
 
 # Training
 def train_model(model, train_loader, val_loader, optimizer, criterion, device, epochs):
 
-    model.train()
-
     for epoch in range(epochs):
-        for batch in train_loader:
+        model.train()
+        train_loss = 0
+        for batch in tqdm(train_loader):
             optimizer.zero_grad()
             peptide, hla, tcr, binding_flag = batch
             pred = model(peptide.to(device), hla.to(device), tcr.to(device))
-            loss = criterion(pred, binding_flag)
+            loss = criterion(pred, binding_flag.to(device))
             loss.backward()
             optimizer.step()
-            
-            val_loss = evaluate_model(model, val_loader)
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item()}, Val Loss: {val_loss}")
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+
+        val_loss, auroc, auprc = evaluate_model(model, val_loader, device, criterion)
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}, AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}")
 
     return model
+
+def evaluate_model(model, val_loader, device, criterion):
+    model.eval()
+    val_loss = 0
+    preds, labels = [], []
+    with torch.no_grad():
+        for batch in tqdm(val_loader):
+            peptide, hla, tcr, binding_flag = batch
+            pred = model(peptide.to(device), hla.to(device), tcr.to(device))
+            loss = criterion(pred, binding_flag.to(device))
+            val_loss += loss.item()
+            preds.append(pred.flatten().cpu())
+            labels.append(binding_flag.flatten().cpu())
+
+    preds = torch.cat(preds).numpy()
+    labels = torch.cat(labels).numpy()
+    auroc = roc_auc_score(labels, preds)
+    auprc = average_precision_score(labels, preds)
+    return val_loss / len(val_loader), auroc, auprc
 
 def main():
 
@@ -80,8 +111,8 @@ def main():
     print(train_dataset[0])
     val_dataset = Dataset(os.getenv("VALIDATION_PATH"))
 
-    train_loader = torch.utils.data.DataLoader(train_dataset)
-    val_loader = torch.utils.data.DataLoader(val_dataset)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=128, shuffle=False)
 
     model = Model()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
