@@ -117,7 +117,7 @@ Use `uv run python` in place of `python` if that is how the existing project env
 
 The starter `ml.py` now validates complete alpha/beta inputs, selects full-chain training/validation subsets, pads without cropping and masks padding during pooling. The first experiment verifies the baseline setup, preserving its architecture and loss. Subsequent experiments test scientific changes. Model proposals contain complete replacement code for `ml.py`; Argon receives no shell tools. The controller syntax-checks proposals, runs fixed subprocess commands with timeouts, and checks hashes of protected source files and configured training/validation data. These checks are not an OS sandbox for executing Python; use the existing isolated workspace and permitted data access.
 
-The default budgets are two experiment attempts, eight API calls (including token counting; four calls per complete experiment), 900 seconds per training/evaluation process, 180 seconds per API request, and one hour for the session. Increase `--max-api-calls` explicitly when requesting more than two experiments. Input context is counted before generation; exceeding `--max-input-tokens` stops the loop rather than truncating the history. API errors or invalid responses stop safely and restore the incumbent source. Training/evaluation failures are logged and returned to Argon for interpretation when the remaining API/time budget permits.
+The default budgets are two experiment attempts, eight API calls (including token counting; four calls per complete experiment), 900 seconds per training/evaluation process, 600 seconds per API request, and one hour for the session. Increase `--max-api-calls` explicitly when requesting more than two experiments. Input context is counted before generation; exceeding `--max-input-tokens` stops the loop rather than truncating the history. API errors or invalid responses stop safely and restore the incumbent source. Training/evaluation failures are logged and returned to Argon for interpretation when the remaining API/time budget permits.
 
 Functions in `agent/agent.py` separate responsibilities:
 
@@ -169,3 +169,18 @@ The CSV must provide the same sequence/length/label columns required by `eval.py
 `final_eval.py` loads the model's exact recorded source in memory and verifies its checkpoint hash, instead of assuming that current `ml.py` still matches every historical architecture. It does not alter current `ml.py`, train, or call Argon. It refuses to run while a controller holds the log lock, or if the supplied CSV is identical to a recorded training/validation file. Results append to the existing log.
 
 Starting final evaluation marks this research history as finalized, even if inference then fails. The controller refuses further autonomous optimisation on that history, so final test results cannot be fed into subsequent model selection. Re-running final evaluation for technical verification is possible, but these results must never be used to select another model; a benchmark remains exposed after the first read. Keep the existing history rather than deleting test records to circumvent this restriction.
+
+
+## Argon context window and thinking settings
+
+`agent/agent.py` is the Python controller; Argon is the remote decision model called through `google.genai.Client().models.generate_content`, with `gemini-4-argon` as the default model ID. This is real API orchestration code, not the previous joke/demo call. Successful live execution still depends on valid credentials, provisioned model access, installed dependencies and local data paths; mock tests do not verify those external conditions.
+
+The controller explicitly sends `thinking_config={"thinking_level": "high"}` by default. Override with `--thinking-level low|medium|high`. It does not send deprecated `thinking_budget`, sampling overrides (`temperature`, `top_p`, `top_k`) or explicit `cached_content`.
+
+The full objective, evaluator, current source and complete log are supplied for each proposal and interpretation. Default input cap is 900,000 tokens, leaving room within Argon's shared 1,048,576-token window for the schema margin and up to 65,536 thinking/output tokens. Input is counted before each generation. Exceeding the configured input cap or shared-window budget stops the loop without truncating history. Actual input capacity depends on the combined request: the entire 1M window cannot simultaneously be filled with input and a full output budget.
+
+`--max-output-tokens` includes thinking as well as the final JSON/code answer. The synchronous controller supports up to 65,536; it deliberately rejects larger values. Generating beyond 65,536 requires the background/long-decode API and its polling lifecycle, which this controller does not implement. Background generation is not needed just to send a large input history. Requests allow 600 seconds by default (`--api-timeout`), still bounded by remaining session time. API response token-usage metadata and finish reasons are logged; truncated responses are rejected rather than applied as partial code.
+
+```bash
+python agent/agent.py --max-experiments 2 --thinking-level high --max-input-tokens 900000 --max-output-tokens 65536 --api-timeout 600
+```
