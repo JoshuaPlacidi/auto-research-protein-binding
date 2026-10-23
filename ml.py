@@ -1,10 +1,15 @@
+import logging
+import os
+
+import pandas as pd
 import torch
 from dotenv import load_dotenv
-import os
-import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 from tqdm import tqdm
+
 load_dotenv()
+
+logger = logging.getLogger("training")
 
 EXPERIMENT_DIR = "experiments/1/"
 
@@ -15,7 +20,7 @@ MAX_TCR_LENGTH = 247
 # Dataset
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, data_path: str):
-        self.data = pd.read_csv(data_path)
+        self.data = pd.read_csv(data_path, low_memory=False)
         self.tokenizer = {"A": 1, "C": 2, "D": 3, "E": 4, "F": 5, "G": 6, "H": 7, "I": 8, "K": 9, "L": 10, "M": 11, "N": 12, "P": 13, "Q": 14, "R": 15, "S": 16, "T": 17, "V": 18, "W": 19, "Y": 20}
 
     def tokenize(self, text: str):
@@ -70,15 +75,15 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, e
         for batch in tqdm(train_loader):
             optimizer.zero_grad()
             peptide, hla, tcr, binding_flag = batch
-            pred = model(peptide.to(device), hla.to(device), tcr.to(device))
-            loss = criterion(pred, binding_flag.to(device))
+            pred = model(peptide.to(device), hla.to(device), tcr.to(device)).squeeze(-1)
+            loss = criterion(pred, binding_flag.to(device).float())
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
         train_loss /= len(train_loader)
 
         val_loss, auroc, auprc = evaluate_model(model, val_loader, device, criterion)
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}, AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}")
+        logger.info(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}, AUROC: {auroc:.4f}, AUPRC: {auprc:.4f}")
 
     return model
 
@@ -89,8 +94,8 @@ def evaluate_model(model, val_loader, device, criterion):
     with torch.no_grad():
         for batch in tqdm(val_loader):
             peptide, hla, tcr, binding_flag = batch
-            pred = model(peptide.to(device), hla.to(device), tcr.to(device))
-            loss = criterion(pred, binding_flag.to(device))
+            pred = model(peptide.to(device), hla.to(device), tcr.to(device)).squeeze(-1)
+            loss = criterion(pred, binding_flag.to(device).float())
             val_loss += loss.item()
             preds.append(pred.flatten().cpu())
             labels.append(binding_flag.flatten().cpu())
@@ -101,14 +106,24 @@ def evaluate_model(model, val_loader, device, criterion):
     auprc = average_precision_score(labels, preds)
     return val_loss / len(val_loader), auroc, auprc
 
+def configure_logger(experiment_dir):
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_handler = logging.FileHandler(os.path.join(experiment_dir, "training.log"), mode="w")
+    stream_handler = logging.StreamHandler()
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
 def main():
 
     os.makedirs(EXPERIMENT_DIR, exist_ok=True)
+    configure_logger(EXPERIMENT_DIR)
 
     train_dataset = Dataset(os.getenv("TRAIN_PATH"))
-
-
-    print(train_dataset[0])
     val_dataset = Dataset(os.getenv("VALIDATION_PATH"))
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
@@ -120,7 +135,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     
-    model = train_model(model, train_loader, val_loader, optimizer, criterion, device, 2)
+    model = train_model(model, train_loader, val_loader, optimizer, criterion, device, epochs=10)
 
     torch.save(model.state_dict(), os.path.join(EXPERIMENT_DIR, "model.pth"))
 
