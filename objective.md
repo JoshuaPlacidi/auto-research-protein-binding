@@ -87,7 +87,7 @@ Agent evaluation records execution validity, whether a hypothesis/change was pro
 
 The single log is the persistent research memory. Store the exact changes/configuration and sufficient revision information to reproduce each run. The evaluator appends one JSON object per evaluation (including failures); append proposal/decision/training records to the same file, preferably as JSON objects per line with an `event` and `experiment_id`. Never rewrite earlier results or present unmeasured scores as measured results.
 
-**Controller requirement:** every agent decision request must contain this objective and the **whole untruncated log**, not a summary, last-N records or selected successes. The agent must read it before acting, not merely write it. If the full history would exceed the configured context budget, stop the loop and report that limitation rather than silently truncate. This document specifies the behaviour; it does not implement API orchestration. The present `agent/agent.py` is a demo API call, so a genuine autonomous feedback cycle cannot be claimed until the operator implements this requirement in the fixed controller. Do not edit the controller yourself under this objective.
+**Controller requirement:** every agent decision request must contain this objective and the **whole untruncated log**, not a summary, last-N records or selected successes. The agent must read it before acting, not merely write it. If the full history would exceed the configured context budget, stop the loop and report that limitation rather than silently truncate. The fixed `agent/agent.py` implements proposal → edit → train → validate → interpret → keep/restore with bounded API calls and runtime. Every proposal and interpretation request is rebuilt with the entire shared log. The research agent must not edit this controller.
 
 Do not use structural features, AF3 outputs, `boltz_embedding_npz`, category annotations, provenance metadata or label-derived fields as model inputs. Do not train on validation/test examples or alter labels/splits. Check duplicate identities and possible leakage, log limitations, and do not silently repair them by changing the supplied partitions. Fit learned preprocessing on training data only. Validate that both complete chains, peptide and HLA sequence are actually used.
 
@@ -96,3 +96,41 @@ For a progress graph, use the validation-loss entries in this same log and rende
 ## Completion
 
 Report the baseline and tested hypotheses, all valid/failed experiments, validation loss, overall and peptide-macro AUROC/AUPRC, relevant novelty-category results, costs and the evidence for the selected model. Show at least one complete proposal → edit → train → evaluate → append decision → ingest full log → next decision cycle before claiming autonomy. State unresolved limitations. During research, **only edit `ml.py` and append to `experiments/evaluation.log` (create the log if absent)**; all other existing source files and datasets remain fixed.
+
+
+## Running the controller
+
+From the repository root, use the existing project environment with its dependencies installed. Set `GEMINI_API_KEY` (or the existing supported Gemini authentication), `TRAIN_PATH` and `VALIDATION_PATH` in the environment or repository `.env`. `TEST_PATH` is not needed by this loop. Run only inside the operator-approved local or scheduler allocation; the controller does not submit remote jobs or allocate a GPU.
+
+```bash
+# Inspect local data and eligibility without calling Argon or training.
+python agent/agent.py --dry-run
+
+# First proof of concept: baseline setup plus one autonomous modification.
+python agent/agent.py --max-experiments 2 --run-timeout 900
+
+# Continue the same history and restore the selected source/checkpoint identity.
+python agent/agent.py --resume --max-experiments 2
+```
+
+Use `uv run python` in place of `python` if that is how the existing project environment is launched. The controller defaults to `gemini-4-argon`; override `--model` only with the exact model identifier supplied by your provider. There is no silent fallback to another model. Use `--category-column COLUMN` for a non-standard category field.
+
+The first experiment asks Argon to correct baseline eligibility, padding, seeding and logging within `ml.py`, preserving the starter architecture and loss. Subsequent experiments test scientific changes. Model proposals contain complete replacement code for `ml.py`; Argon receives no shell tools. The controller syntax-checks proposals, runs fixed subprocess commands with timeouts, and checks hashes of protected source files and configured training/validation data. These checks are not an OS sandbox for executing Python; use the existing isolated workspace and permitted data access.
+
+The default budgets are two experiment attempts, eight API calls (including token counting; four calls per complete experiment), 900 seconds per training/evaluation process, 180 seconds per API request, and one hour for the session. Increase `--max-api-calls` explicitly when requesting more than two experiments. Input context is counted before generation; exceeding `--max-input-tokens` stops the loop rather than truncating the history. API errors or invalid responses stop safely and restore the incumbent source. Training/evaluation failures are logged and returned to Argon for interpretation when the remaining API/time budget permits.
+
+Functions in `agent/agent.py` separate responsibilities:
+
+| Function | Responsibility |
+| --- | --- |
+| `inspect_environment` | Validate local inputs and provide aggregate schema/cohort statistics |
+| `build_context` | Load objective, evaluator, current source and full history |
+| `propose_experiment` | Ask Argon for one hypothesis, rationale and replacement `ml.py` |
+| `apply_model_change` | Syntax-check and update only `ml.py` |
+| `run_training` | Execute `ml.main()` with a unique checkpoint directory and seed |
+| `run_evaluation` | Execute fixed validation evaluation and verify the resulting report |
+| `decide_next_action` | Ask Argon to interpret the full history and justify a decision |
+| `restore_or_keep` | Promote a kept model; otherwise restore the incumbent source |
+| `run_agent_loop` | Coordinate bounded experiments, logging, recovery and the shared-log lock |
+
+Each experiment gets a generated checkpoint directory under `experiments/`; all proposals, source revisions, decisions and metrics remain in the one shared log. No separate source backups or summary files are created. The selected checkpoint path is printed at completion and recorded in the log. `discard` and `investigate` restore the incumbent source; follow-up experiments may reconstruct a prior candidate from its logged source. `--resume` verifies the protocol and selected checkpoint hash and restores the corresponding `ml.py`. An interrupted proposal remains in the history; it is never silently treated as accepted. Run only one controller per shared history; concurrent controllers are rejected through a log lock.
