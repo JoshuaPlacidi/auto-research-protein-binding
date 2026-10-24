@@ -268,7 +268,6 @@ def main():
                       agent_evaluation={"execution_valid": False, "decision": "failed"})
     record["evaluation_runtime_seconds"] = time.perf_counter() - started
     append_log(args.log_path, record)
-    print(json.dumps(record, indent=2, allow_nan=False))
     if record["status"] == "failed":
         raise SystemExit(1)
 

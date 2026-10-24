@@ -2,7 +2,7 @@
 
 Improve prediction of whether a T-cell receptor binds a peptide–MHC complex, using amino-acid sequences only.
 
-The repository `ml.py` is the starter and is never overwritten. Each experiment names a parent (`starter` or an earlier experiment id), states one falsifiable hypothesis, and returns targeted search-replace edits. An empty edit list copies the parent unchanged. Do not rewrite the whole file.
+The repository `ml.py` is the starter and is never overwritten. Each experiment names a parent (`starter` or an earlier experiment id), states a falsifiable hypothesis, and returns search-replace edits. An empty edit list copies the parent unchanged.
 
 ## Data
 

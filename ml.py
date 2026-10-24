@@ -140,10 +140,8 @@ def train_model(model, train_loader, val_loader, optimizer, criterion, device, e
 
 def main():
     import numpy as np
-    seed = int(os.getenv("RESEARCH_SEED", "31"))
-    epochs = int(os.getenv("RESEARCH_EPOCHS", "10"))
-    if epochs < 1:
-        raise ValueError("RESEARCH_EPOCHS must be positive")
+    seed = 42
+    epochs = 10
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

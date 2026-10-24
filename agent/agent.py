@@ -37,6 +37,7 @@ STARTER = ROOT / "ml.py"
 SESSION_DIR = None
 SESSION_STARTED_AT = None
 MAX_EDITS = 8
+MAX_REPAIRS = 5
 HIGHLIGHT_GROUPS = (
     "unseen_tcr", "unseen_peptide", "unseen_hla", "unseen_pmhc",
     "unseen_tcr_and_pmhc", "completely_unseen_tcr_peptide_hla", "fully_seen_components",
@@ -50,7 +51,7 @@ _SUMMARY_COLUMNS = (
     "n", "n_positive", "n_negative",
     "best_validation_loss", "best_auroc", "loss_vs_parent", "auroc_vs_parent",
     "epochs_completed", "epochs_planned", "learning_rate", "training_objective",
-    "train_runtime_seconds", "final_train_loss",
+    "train_runtime_seconds", "final_train_loss", "context_tokens",
     *[f"{name}_{metric}" for name in HIGHLIGHT_GROUPS for metric in _GROUP_METRICS],
     "error",
 )
@@ -107,6 +108,23 @@ def metric_text(value):
     return "—" if value is None else f"{value:.4f}"
 
 
+def prompt_context(directory):
+    """Provider prompt-token count, or the preflight count when the response has none."""
+    request = response = None
+    for record in read_records(directory / "log.jsonl"):
+        if record.get("phase") != "proposal":
+            continue
+        if record.get("event") == "api_request":
+            request = record
+        elif record.get("event") == "api_response":
+            response = record
+    actual = ((response or {}).get("token_usage") or {}).get("prompt_token_count")
+    if isinstance(actual, int):
+        return actual
+    estimate = (request or {}).get("input_tokens")
+    return estimate if isinstance(estimate, int) else None
+
+
 def show_result(experiment_id, record):
     if record:
         overall = (record.get("metrics") or {}).get("overall") or {}
@@ -123,11 +141,13 @@ def show_result(experiment_id, record):
             row = evaluations[-1].get("metrics", {}).get("overall", {})
             mark = "*" if directory.name == experiment_id else " "
             say(f"   {mark} {directory.name}  loss {metric_text(row.get('validation_loss'))}"
-                f"  auroc {metric_text(row.get('auroc'))}  auprc {metric_text(row.get('auprc'))}")
+                f"  auroc {metric_text(row.get('auroc'))}  auprc {metric_text(row.get('auprc'))}"
+                f"  ctx {prompt_context(directory) or '—'}")
         elif directory.name == experiment_id or any(
                 r.get("event") == "experiment_failure" for r in read_records(directory / "log.jsonl")):
             mark = "*" if directory.name == experiment_id else " "
-            say(f"   {mark} {directory.name}  failed")
+            ctx = prompt_context(directory)
+            say(f"   {mark} {directory.name}  failed" + (f"  ctx {ctx}" if ctx else ""))
 
 
 def append_log(path, event, **fields):
@@ -283,6 +303,7 @@ def summarize_experiment(directory):
         "metrics": metrics,
         "groups": groups,
         "provided_categories": provided,
+        "context_tokens": prompt_context(directory),
     }
 
 
@@ -339,6 +360,7 @@ def _flat_summary_row(session_id, row):
         "training_objective": training.get("loss"),
         "train_runtime_seconds": training.get("runtime_seconds"),
         "final_train_loss": training.get("final_train_loss"),
+        "context_tokens": row.get("context_tokens"),
         "error": row.get("error"),
     }
     for name in HIGHLIGHT_GROUPS:
@@ -486,8 +508,16 @@ def experiment_history(directory):
             for key in ("parent", "hypothesis", "change", "edits"):
                 if key in record:
                     entry[key] = record[key]
+        elif event == "training_configuration":
+            epochs = []
         elif event == "training_epoch":
             epochs.append({key: record.get(key) for key in ("epoch", "train_loss", "validation_loss")})
+        elif event == "repair":
+            lines = [line.strip() for line in (record.get("error") or "").splitlines() if line.strip()]
+            entry.setdefault("repairs", []).append({
+                "change": record.get("change"),
+                "error": lines[-1][:240] if lines else None,
+            })
         elif event == "model_evaluation":
             metrics = record.get("metrics") or {}
             overall = metrics.get("overall") if isinstance(metrics.get("overall"), dict) else {}
@@ -526,13 +556,15 @@ def build_context(task, data_summary):
             "The controller copies the named parent ml.py into a new experiment directory and applies edits. "
             "parent is starter or an existing experiment id. edits is an ordered list of {old, new} strings; "
             "each old must occur exactly once in the parent file; at most 8 edits; an empty list copies the parent unchanged. "
-            "Do not return a full ml.py. Do not change evaluator/data/dependencies/controller, access test data, "
+            f"If that run fails because of the code, you can repair the same file up to {MAX_REPAIRS} times. "
+            f"After repair {MAX_REPAIRS} the experiment is abandoned. "
+            "Do not change evaluator/data/dependencies/controller, access test data, "
             "or make API/network calls from ml.py. "
             "Keep Dataset.data in original CSV order; select eligible full-chain rows with Subset for training. "
             "Validate chain boundaries and use complete untruncated alpha+beta, peptide and HLA sequences. "
             "Maintain Model(), Dataset(path), main(), and forward(peptide,hla,tcr) interfaces. "
             "main() must use the module EXPERIMENT_DIR, set by the controller, and save model.pth there. "
-            "Seed Python, numpy and torch from RESEARCH_SEED; record actual hyperparameters and epoch metrics. "
+            "Seed Python, numpy and torch; record actual hyperparameters and epoch metrics. "
             "Append aggregate-only training events to RESEARCH_LOG_PATH. Never print/log raw rows, "
             "patient information, sequence tables, secrets, or create training.log/summary/plot files. "
             "CPU/GPU use must respect the operator's environment and scheduler allocation. "
@@ -587,6 +619,7 @@ class ArgonClient:
             prompt += "\n\nReturn one JSON object matching this schema and no other text:\n" + json.dumps(schema)
         tokens, count_method = self._count_input(prompt)
         self._check_input_budget(tokens)
+        say(f"  context  {'~' if count_method == 'estimate_utf8_div3' else ''}{tokens}")
         append_log(log_path, "api_request", experiment_id=experiment_id, phase=phase, provider=self.provider,
                    input_tokens=tokens, input_token_count_method=count_method,
                    context_sha256=source_hash(prompt), api_calls_used=self.calls,
@@ -746,6 +779,18 @@ class ArgonClient:
         return any("MAX_TOKENS" in reason or reason.lower() == "length" for reason in finishes)
 
 
+REPAIR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "change": {"type": "string"},
+        "edits": {"type": "array", "items": {"type": "object", "properties": {
+            "old": {"type": "string"}, "new": {"type": "string"}},
+            "required": ["old", "new"]}},
+    },
+    "required": ["change", "edits"],
+}
+
+
 PROPOSAL_SCHEMA = {
     "type": "object",
     "properties": {
@@ -808,8 +853,8 @@ def propose_experiment(client, data_summary, experiment_id, log_path):
                 "Use an empty edits list unless you must correct full-chain filtering/padding, "
                 "seeding, shared logging or output-interface issues.")
     else:
-        task = ("Propose ONE scientifically motivated model/training change based on the complete history. "
-                "Set parent to starter or an existing experiment id. Return targeted search-replace edits, not a full file.")
+        task = ("Propose a scientifically motivated change based on the complete history. "
+                "Set parent to starter or an existing experiment id. Return search-replace edits.")
     task += f" Experiment ID: {experiment_id}. Available parents: {available}."
     proposal = client.ask(build_context(task, data_summary), PROPOSAL_SCHEMA,
                           "proposal", experiment_id, log_path)
@@ -824,55 +869,82 @@ def materialize_experiment(directory, proposal):
     return source
 
 
+def propose_repair(client, experiment_id, log_path, source, error, attempt):
+    task = (
+        f"Repair {attempt} of {MAX_REPAIRS}. "
+        "The current ml.py failed before a valid evaluation. "
+        "Return search-replace edits that fix this failure and keep the experiment's intended change. "
+        "A failed repair uses one of the remaining attempts, and the experiment is abandoned after the last one.\n\n"
+        f"Error:\n{error}\n\n"
+        f"ml.py:\n{source}"
+    )
+    repair = client.ask(task, REPAIR_SCHEMA, "repair", experiment_id, log_path)
+    require_strings(repair, ["change"])
+    if not repair.get("edits"):
+        raise ValueError("Repair returned no edits")
+    return repair
+
+
 def run_command(command, experiment_id, stage, env, timeout, log_path):
     """Fixed argv; poll for stop requests, then allow checkpoint saving before kill."""
     say(f"  {stage}")
     start = time.monotonic()
     announced = start
-    process = subprocess.Popen(command, cwd=ROOT, env=env, start_new_session=(os.name == "posix"))
+    code = None
+    err_path = log_path.with_name(f".{stage}.err")
+    err_handle = err_path.open("w", encoding="utf-8")
+    process = subprocess.Popen(command, cwd=ROOT, env=env, stderr=err_handle,
+                               start_new_session=(os.name == "posix"))
     try:
-        while True:
-            check_stop()
-            remaining = timeout - (time.monotonic() - start)
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(command, timeout)
-            try:
-                code = process.wait(timeout=min(1.0, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                if time.monotonic() - announced >= 15:
-                    say(f"  {stage} · {time.monotonic() - start:.0f}s")
-                    announced = time.monotonic()
-                continue
-    except BaseException:
         try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGINT)
-            else:
-                process.terminate()
-            process.wait(timeout=10)
-        except (subprocess.TimeoutExpired, ProcessLookupError):
-            if os.name == "posix":
+            while True:
+                check_stop()
+                remaining = timeout - (time.monotonic() - start)
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            else:
-                process.kill()
-            process.wait()
+                    code = process.wait(timeout=min(1.0, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() - announced >= 15:
+                        say(f"  {stage} · {time.monotonic() - start:.0f}s")
+                        announced = time.monotonic()
+                    continue
+        except BaseException:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGINT)
+                else:
+                    process.terminate()
+                process.wait(timeout=10)
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+                process.wait()
+            append_log(log_path, "execution", experiment_id=experiment_id, stage=stage,
+                       status="interrupted_or_timeout", runtime_seconds=time.monotonic()-start)
+            raise
         append_log(log_path, "execution", experiment_id=experiment_id, stage=stage,
-                   status="interrupted_or_timeout", runtime_seconds=time.monotonic()-start)
-        raise
-    append_log(log_path, "execution", experiment_id=experiment_id, stage=stage,
-               returncode=code, runtime_seconds=time.monotonic()-start)
-    if code:
-        raise RuntimeError(f"{stage} exited with code {code}; see console and experiment log")
+                   returncode=code, runtime_seconds=time.monotonic()-start)
+        if code:
+            err_handle.flush()
+            detail = err_path.read_text(encoding="utf-8", errors="replace").strip()
+            tail = detail[-4000:] if detail else ""
+            raise RuntimeError(f"{stage} exited with code {code}" + (f"\n{tail}" if tail else ""))
+    finally:
+        err_handle.close()
+        err_path.unlink(missing_ok=True)
 
 
 def run_training(experiment_id, directory, args, deadline, log_path):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1",
                EXPERIMENT_DIR=str(directory), RESEARCH_LOG_PATH=str(log_path),
-               RESEARCH_EXPERIMENT_ID=experiment_id, RESEARCH_SEED=str(args.seed))
+               RESEARCH_EXPERIMENT_ID=experiment_id)
     launcher = ("import os, sys\n"
                 "sys.path.insert(0, os.environ['EXPERIMENT_DIR'])\n"
                 "import ml\n"
@@ -907,11 +979,12 @@ def run_evaluation(experiment_id, directory, proposal, args, deadline, log_path)
                 max(0.01, min(args.run_timeout, deadline-time.monotonic())), log_path)
     records = [r for r in read_records(log_path) if r.get("event") == "model_evaluation"
                and r.get("experiment_id") == experiment_id]
-    if len(records) != 1 or records[0].get("status") != "valid":
-        raise RuntimeError("Expected exactly one valid fixed-evaluator report")
-    if records[0].get("split") != "validation" or records[0].get("ml_sha256") != digest(directory / "ml.py"):
+    record = records[-1] if records else None
+    if record is None or record.get("status") != "valid":
+        raise RuntimeError("Expected a valid fixed-evaluator report")
+    if record.get("split") != "validation" or record.get("ml_sha256") != digest(directory / "ml.py"):
         raise RuntimeError("Evaluation split/source identity mismatch")
-    return records[0]
+    return record
 
 
 def open_session(args, protocol):
@@ -941,6 +1014,47 @@ def open_session(args, protocol):
     directory.mkdir(parents=True)
     SESSION_DIR = directory
     return directory, False
+
+
+def run_experiment(client, directory, proposal, args, deadline, log_path, protected):
+    """Train and evaluate. A code failure gets up to MAX_REPAIRS edits of this same file."""
+    experiment_id = directory.name
+    last_error = None
+    for attempt in range(MAX_REPAIRS + 1):
+        try:
+            if attempt:
+                say(f"  repair  {attempt}/{MAX_REPAIRS}")
+                source = ((directory / "ml.py").read_text(encoding="utf-8")
+                          if (directory / "ml.py").is_file() else parent_source(proposal["parent"]))
+                repair = propose_repair(client, experiment_id, log_path, source, last_error, attempt)
+                show_proposal({"parent": experiment_id, "change": repair["change"], "edits": repair.get("edits")})
+                source = apply_edits(source, repair.get("edits"))
+                write_experiment_source(directory, source)
+                append_log(log_path, "repair", experiment_id=experiment_id, attempt=attempt,
+                           error=last_error, ml_sha256=source_hash(source), **repair)
+            else:
+                source = materialize_experiment(directory, proposal)
+                append_log(log_path, "proposal", experiment_id=experiment_id,
+                           ml_sha256=source_hash(source), **proposal)
+            run_training(experiment_id, directory, args, deadline, log_path)
+            assert_unchanged(protected)
+            record = run_evaluation(experiment_id, directory, proposal, args, deadline, log_path)
+            assert_unchanged(protected)
+            return record
+        except StopRequested:
+            raise
+        except Exception as exc:
+            if str(exc).startswith("Protected input changed"):
+                raise
+            last_error = str(exc)
+            if len(last_error) > 4000:
+                last_error = last_error[-4000:]
+            lines = last_error.splitlines() or [last_error]
+            say(f"  failed  {lines[0]}")
+            for line in lines[1:40]:
+                say(f"    {line}")
+    append_log(log_path, "experiment_failure", experiment_id=experiment_id, error=last_error)
+    return None
 
 
 def _run_agent_loop(args, client_factory=ArgonClient):
@@ -983,15 +1097,12 @@ def _run_agent_loop(args, client_factory=ArgonClient):
             try:
                 proposal = propose_experiment(client, data_summary, experiment_id, log_path)
                 show_proposal(proposal)
-                source = materialize_experiment(directory, proposal)
-                append_log(log_path, "proposal", experiment_id=experiment_id, seed=args.seed,
-                           ml_sha256=source_hash(source), **proposal)
-                run_training(experiment_id, directory, args, deadline, log_path)
-                assert_unchanged(protected)
-                record = run_evaluation(experiment_id, directory, proposal, args, deadline, log_path)
-                assert_unchanged(protected)
-                latest = directory
-                show_result(experiment_id, record)
+                record = run_experiment(client, directory, proposal, args, deadline, log_path, protected)
+                if record:
+                    latest = directory
+                    show_result(experiment_id, record)
+                else:
+                    show_result(experiment_id, None)
             except StopRequested:
                 raise
             except Exception as exc:
@@ -1058,7 +1169,6 @@ def parse_args(argv=None):
                         help="Full-prompt input cap, including safety margin; never silently truncated")
     parser.add_argument("--max-output-tokens", type=int, default=65536,
                         help="Combined thinking and answer cap; synchronous maximum is 65536")
-    parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--category-column")
     parser.add_argument("--resume", action="store_true",
                         help="Continue the latest session, or the session named by --session")
