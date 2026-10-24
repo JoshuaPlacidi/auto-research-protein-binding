@@ -1,8 +1,8 @@
 # Autonomous Research for TCR–pMHC Binding
 
-# TCR-pMHC Binding - The Mark of Immunity
+# TCR-pMHC Binding - The Marker of Immunity
 
-The immune system uses T-cell receptors (TCRs) to recognise potentially harmful cells, such as viruses and cacner. Cells display small fragments of proteins, called peptides, on their surface using molecules known as MHCs, forming peptdie-MHC (pMHC) complexes. When a TCR binds to a specific pMHC complex, it signals that the T cell has recognised its target and can trigger an immune response. Predicting which TCRs bind to which pMHC complexes is therefore a fundamental step towards understanding and harnessing the immune system.
+The immune system uses T-cell receptors (TCRs) to recognise potentially harmful cells, such as viruses and cancer. Cells display small fragments of proteins, called peptides, on their surface using molecules known as MHCs, forming peptdie-MHC (pMHC) complexes. When a TCR binds to a specific pMHC complex, it signals that the T cell has recognised its target and can trigger an immune response. Predicting which TCRs bind to which pMHC complexes is therefore a fundamental step towards understanding and harnessing the immune system.
 
 ![TCR–pMHC binding cartoon](./figures/tcr_pmhc_cartoon.png)
 
@@ -50,6 +50,12 @@ Argon then iteratively:
 6. decides what to try next.
 
 The focus is contextual scientific iteration, not only model optiminsation: each experiment is informed by the growing research history, allowing the agent to build hypotheses cumulatively rather than treating each run in isolation.
+
+## Sequence baselines
+
+These VICReg models were trained before the autonomous search. Global AUROC is on the same complete α+β validation and test cohorts the hackathon evaluator scores.
+
+![Sequence baselines](./figures/sequence_baseline_aucs.png)
 
 ## Research goal
 
