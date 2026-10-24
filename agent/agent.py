@@ -38,6 +38,8 @@ SESSION_DIR = None
 SESSION_STARTED_AT = None
 MAX_EDITS = 8
 MAX_REPAIRS = 5
+API_TIMEOUT = 600
+THINKING_LEVEL = "high"
 HIGHLIGHT_GROUPS = (
     "unseen_tcr", "unseen_peptide", "unseen_hla", "unseen_pmhc",
     "unseen_tcr_and_pmhc", "completely_unseen_tcr_peptide_hla", "fully_seen_components",
@@ -89,8 +91,7 @@ def preview_lines(text, limit=8):
 
 def show_proposal(proposal):
     say(f"  parent  {proposal['parent']}")
-    brief = " ".join(proposal["change"].split())
-    say(f"  change  {brief if len(brief) <= 240 else brief[:237] + '...'}")
+    say(f"  change  {' '.join(proposal['change'].split())}")
     edits = proposal.get("edits") or []
     if not edits:
         say("  edits   none")
@@ -579,14 +580,14 @@ def build_context(task, data_summary):
 
 class ArgonClient:
     """One research client. Gemini counts tokens then requests JSON; OpenRouter sends one structured chat completion."""
-    def __init__(self, args, deadline):
-        self.args, self.deadline, self.calls = args, deadline, 0
+    def __init__(self, args):
+        self.args, self.calls = args, 0
         self.provider = args.provider
         self.client = None
         self._openrouter_key = None
         if self.provider == "gemini":
             from google import genai
-            self.client = genai.Client(http_options={"timeout": int(args.api_timeout * 1000),
+            self.client = genai.Client(http_options={"timeout": int(API_TIMEOUT * 1000),
                                                     "retry_options": {"attempts": 1}})
         elif self.provider == "openrouter":
             key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -602,20 +603,16 @@ class ArgonClient:
 
     def _begin_call(self):
         check_stop()
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise StopRequested("Session runtime budget exhausted")
         self.calls += 1
-        return remaining
+        return API_TIMEOUT
 
     def call(self, method, **kwargs):
-        remaining = self._begin_call()
-        kwargs.setdefault("config", {})["http_options"] = {
-            "timeout": max(1, int(min(self.args.api_timeout, remaining) * 1000))}
+        self._begin_call()
+        kwargs.setdefault("config", {})["http_options"] = {"timeout": int(API_TIMEOUT * 1000)}
         return getattr(self.client.models, method)(model=self.args.model, **kwargs)
 
     def ask(self, prompt, schema, phase, experiment_id, log_path):
-        if self.provider == "openrouter" and not self.args.openrouter_strict:
+        if self.provider == "openrouter":
             prompt += "\n\nReturn one JSON object matching this schema and no other text:\n" + json.dumps(schema)
         tokens, count_method = self._count_input(prompt)
         self._check_input_budget(tokens)
@@ -623,11 +620,11 @@ class ArgonClient:
         append_log(log_path, "api_request", experiment_id=experiment_id, phase=phase, provider=self.provider,
                    input_tokens=tokens, input_token_count_method=count_method,
                    context_sha256=source_hash(prompt), api_calls_used=self.calls,
-                   thinking_level=self.args.thinking_level if self.provider == "gemini" else None,
+                   thinking_level=THINKING_LEVEL if self.provider == "gemini" else None,
                    max_output_tokens=self.args.max_output_tokens)
         text, finishes, token_usage = self._generate(prompt, schema, phase)
         append_log(log_path, "api_response", experiment_id=experiment_id, phase=phase, provider=self.provider,
-                   finish_reasons=finishes, token_usage=token_usage)
+                   finish_reasons=finishes, token_usage=token_usage, response_text=text)
         who = "Argon" if self.provider == "gemini" else "OpenRouter"
         if self._output_truncated(finishes):
             raise ValueError(f"{who} reached its thinking/output cap; no partial model code will be applied")
@@ -661,7 +658,7 @@ class ArgonClient:
         response = self.call("generate_content", contents=prompt, config={
             "response_mime_type": "application/json", "response_json_schema": schema,
             "max_output_tokens": self.args.max_output_tokens,
-            "thinking_config": {"thinking_level": self.args.thinking_level},
+            "thinking_config": {"thinking_level": THINKING_LEVEL},
         })
         usage = getattr(response, "usage_metadata", None)
         finishes = [str(getattr(candidate, "finish_reason", ""))
@@ -671,35 +668,21 @@ class ArgonClient:
                         "thoughts_token_count", "total_token_count")}
         return response.text, finishes, token_usage
 
-    def _openrouter_payload(self, prompt, schema, phase):
-        if self.args.openrouter_strict:
-            wired = dict(schema)
-            wired["additionalProperties"] = False
-            response_format = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "proposal" if phase == "proposal" else "decision",
-                    "strict": True,
-                    "schema": wired,
-                },
-            }
-        else:
-            response_format = {"type": "json_object"}
+    def _openrouter_payload(self, prompt):
         return {
             "model": self.args.model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": self.args.max_output_tokens,
-            "response_format": response_format,
+            "response_format": {"type": "json_object"},
             "provider": {"require_parameters": True},
             "plugins": [{"id": "context-compression", "enabled": False}],
         }
 
     def _generate_openrouter(self, prompt, schema, phase):
-        remaining = self._begin_call()
-        timeout = max(1.0, min(self.args.api_timeout, remaining))
+        self._begin_call()
         request = urllib.request.Request(
             "https://openrouter.ai/api/v1/chat/completions",
-            data=json.dumps(self._openrouter_payload(prompt, schema, phase), ensure_ascii=False).encode("utf-8"),
+            data=json.dumps(self._openrouter_payload(prompt), ensure_ascii=False).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {self._openrouter_key}",
                 "Content-Type": "application/json",
@@ -708,7 +691,7 @@ class ArgonClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=API_TIMEOUT) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -853,7 +836,9 @@ def propose_experiment(client, data_summary, experiment_id, log_path):
                 "Use an empty edits list unless you must correct full-chain filtering/padding, "
                 "seeding, shared logging or output-interface issues.")
     else:
-        task = ("Propose a scientifically motivated change based on the complete history. "
+        task = ("Propose one main idea based on the complete history. "
+                "The idea may be a large replacement or a small adjustment. "
+                "Try to test that one idea, rather than bundling several independent changes into the same experiment. "
                 "Set parent to starter or an existing experiment id. Return search-replace edits.")
     task += f" Experiment ID: {experiment_id}. Available parents: {available}."
     proposal = client.ask(build_context(task, data_summary), PROPOSAL_SCHEMA,
@@ -941,7 +926,7 @@ def run_command(command, experiment_id, stage, env, timeout, log_path):
         err_path.unlink(missing_ok=True)
 
 
-def run_training(experiment_id, directory, args, deadline, log_path):
+def run_training(experiment_id, directory, args, log_path):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1",
                EXPERIMENT_DIR=str(directory), RESEARCH_LOG_PATH=str(log_path),
                RESEARCH_EXPERIMENT_ID=experiment_id)
@@ -952,7 +937,7 @@ def run_training(experiment_id, directory, args, deadline, log_path):
                 "ml.main()\n")
     try:
         run_command([sys.executable, "-B", "-c", launcher], experiment_id, "training", env,
-                    max(0.01, min(args.run_timeout, deadline-time.monotonic())), log_path)
+                    args.run_timeout, log_path)
     finally:
         append_log(log_path, "checkpoint_inventory", experiment_id=experiment_id,
                    experiment_dir=str(directory),
@@ -962,12 +947,10 @@ def run_training(experiment_id, directory, args, deadline, log_path):
         raise RuntimeError("Training did not produce model.pth in its assigned directory")
 
 
-def run_evaluation(experiment_id, directory, proposal, args, deadline, log_path):
+def run_evaluation(experiment_id, directory, proposal, args, log_path):
     argv = ["--experiment_dir", str(directory), "--experiment-id", experiment_id,
             "--log-path", str(log_path), "--hypothesis", proposal["hypothesis"],
             "--change", proposal["change"]]
-    if args.category_column:
-        argv += ["--category-column", args.category_column]
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1",
                EXPERIMENT_DIR=str(directory), EVAL_ARGV=json.dumps(argv))
     launcher = ("import json, os, sys\n"
@@ -976,7 +959,7 @@ def run_evaluation(experiment_id, directory, proposal, args, deadline, log_path)
                 "import eval as E\n"
                 "E.main()\n")
     run_command([sys.executable, "-B", "-c", launcher], experiment_id, "validation", env,
-                max(0.01, min(args.run_timeout, deadline-time.monotonic())), log_path)
+                max(0.01, args.run_timeout), log_path)
     records = [r for r in read_records(log_path) if r.get("event") == "model_evaluation"
                and r.get("experiment_id") == experiment_id]
     record = records[-1] if records else None
@@ -1016,7 +999,7 @@ def open_session(args, protocol):
     return directory, False
 
 
-def run_experiment(client, directory, proposal, args, deadline, log_path, protected):
+def run_experiment(client, directory, proposal, args, log_path, protected):
     """Train and evaluate. A code failure gets up to MAX_REPAIRS edits of this same file."""
     experiment_id = directory.name
     last_error = None
@@ -1036,9 +1019,9 @@ def run_experiment(client, directory, proposal, args, deadline, log_path, protec
                 source = materialize_experiment(directory, proposal)
                 append_log(log_path, "proposal", experiment_id=experiment_id,
                            ml_sha256=source_hash(source), **proposal)
-            run_training(experiment_id, directory, args, deadline, log_path)
+            run_training(experiment_id, directory, args, log_path)
             assert_unchanged(protected)
-            record = run_evaluation(experiment_id, directory, proposal, args, deadline, log_path)
+            record = run_evaluation(experiment_id, directory, proposal, args, log_path)
             assert_unchanged(protected)
             return record
         except StopRequested:
@@ -1069,7 +1052,6 @@ def _run_agent_loop(args, client_factory=ArgonClient):
                         "max_experiments": args.max_experiments, "api_called": False}, indent=2))
         return
     session_dir, resumed = open_session(args, protected)
-    deadline = time.monotonic() + args.session_timeout
     session_id = session_dir.name
     SESSION_STARTED_AT = datetime.now(timezone.utc).isoformat()
     ACTIVE_PATH.write_text(session_id, encoding="utf-8")
@@ -1082,11 +1064,9 @@ def _run_agent_loop(args, client_factory=ArgonClient):
     client = None
     latest = None
     try:
-        client = client_factory(args, deadline)
+        client = client_factory(args)
         for _ in range(args.max_experiments):
             check_stop()
-            if time.monotonic() >= deadline:
-                raise StopRequested("Session runtime budget exhausted")
             assert_unchanged(protected)
             experiment_id = next_experiment_id()
             directory = session_dir / experiment_id
@@ -1097,7 +1077,7 @@ def _run_agent_loop(args, client_factory=ArgonClient):
             try:
                 proposal = propose_experiment(client, data_summary, experiment_id, log_path)
                 show_proposal(proposal)
-                record = run_experiment(client, directory, proposal, args, deadline, log_path, protected)
+                record = run_experiment(client, directory, proposal, args, log_path, protected)
                 if record:
                     latest = directory
                     show_result(experiment_id, record)
@@ -1156,27 +1136,20 @@ def parse_args(argv=None):
     parser.add_argument("--provider", choices=("gemini", "openrouter"), default="gemini")
     parser.add_argument("--model", default="gemini-4-argon",
                         help="Gemini model id, or vendor/name when --provider openrouter")
-    parser.add_argument("--openrouter-strict", action=argparse.BooleanOptionalAction, default=False,
-                        help="Require an OpenRouter endpoint that enforces a JSON schema. Default sends JSON-object mode so smaller models can be routed")
     parser.add_argument("--max-experiments", type=int, default=2,
                         help="Total attempts this invocation, including initial baseline setup")
     parser.add_argument("--run-timeout", type=float, default=900,
                         help="Seconds per training/evaluation subprocess")
-    parser.add_argument("--session-timeout", type=float, default=3600)
-    parser.add_argument("--api-timeout", type=float, default=600)
-    parser.add_argument("--thinking-level", choices=("low", "medium", "high"), default="high")
     parser.add_argument("--max-input-tokens", type=int, default=900000,
                         help="Full-prompt input cap, including safety margin; never silently truncated")
     parser.add_argument("--max-output-tokens", type=int, default=65536,
                         help="Combined thinking and answer cap; synchronous maximum is 65536")
-    parser.add_argument("--category-column")
     parser.add_argument("--resume", action="store_true",
                         help="Continue the latest session, or the session named by --session")
     parser.add_argument("--session", help="Session directory name under experiments/ to resume")
     parser.add_argument("--dry-run", action="store_true", help="Local data preflight only; no API/training")
     args = parser.parse_args(argv)
-    for name in ("max_experiments", "run_timeout", "session_timeout", "api_timeout",
-                 "max_input_tokens", "max_output_tokens"):
+    for name in ("max_experiments", "run_timeout", "max_input_tokens", "max_output_tokens"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.max_output_tokens > 65536:
