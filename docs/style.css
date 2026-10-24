@@ -21,7 +21,7 @@ body {
   line-height: 1.45;
 }
 
-.top, .stats, main, .controls, footer {
+.top, .stats, main, .controls, .changelog, footer {
   width: min(1180px, calc(100% - 32px));
   margin-left: auto;
   margin-right: auto;
@@ -174,9 +174,48 @@ button, select {
 select { background: white; color: var(--ink); border: 1px solid var(--line); }
 #progress { margin: 0 0 0 auto; color: var(--muted); }
 
+.changelog {
+  margin-top: 16px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  box-shadow: var(--shadow);
+  padding: 16px 16px 8px;
+}
+
+#change-log {
+  list-style: none;
+  margin: 12px 0 8px;
+  padding: 0;
+  max-height: 280px;
+  overflow: auto;
+  position: relative;
+}
+
+.change-row {
+  display: grid;
+  grid-template-columns: 58px 148px minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+  padding: 8px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.change-row.current { background: #f3eee4; }
+.change-row .id { font-weight: 600; font-variant-numeric: tabular-nums; }
+.change-row .score { color: var(--muted); font-variant-numeric: tabular-nums; }
+.change-row.best .score { color: var(--green); }
+.change-row.failed .score { color: var(--red); }
+.change-row p { margin: 0; }
+.change-empty { margin: 8px 10px 14px; color: var(--muted); font-size: 14px; }
+
 footer { margin: 18px auto 32px; color: var(--muted); font-size: 13px; }
 
 @media (max-width: 900px) {
   .stats, main { grid-template-columns: 1fr; }
   #progress { margin-left: 0; }
+  .change-row { grid-template-columns: 52px 1fr; }
+  .change-row p { grid-column: 1 / -1; }
 }

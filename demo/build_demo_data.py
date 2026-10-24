@@ -240,10 +240,13 @@ def build(session: Path) -> dict:
     return {
         "session_id": session.name,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "metric_definition": "validation_loss is the fixed evaluator's probability MSE. It is not bits-per-byte.",
+        "metric_definition": (
+            "validation_auroc is the fixed evaluator's AUROC. Higher is better. "
+            "The replay tracks this metric so sessions can be compared."
+        ),
         "decision_recording": DECISION_NOTE,
         "running_best_definition": (
-            "best_so_far_loss is the running minimum validation loss among valid experiments, "
+            "best_so_far_auroc is the running maximum validation AUROC among valid experiments, "
             "in chronological order. It is not a keep decision."
         ),
         "backtrack_definition": (
@@ -283,11 +286,11 @@ def main() -> None:
     payload = build(session)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    best = payload["best_validation_loss_experiment"] or {}
+    best = payload["highest_auroc_experiment"] or {}
     print(
         f"session {payload['session_id']}: {payload['completed_experiments']} in replay, "
         f"{len(payload['excluded'])} excluded, "
-        f"lowest loss {best.get('experiment_id')} {best.get('validation_loss')}"
+        f"highest AUROC {best.get('experiment_id')} {best.get('validation_auroc')}"
     )
     print(args.output)
 

@@ -1,9 +1,9 @@
 {
   "session_id": "20261024-151511-c32e",
-  "generated_at": "2026-10-24T16:54:27.660051+00:00",
-  "metric_definition": "validation_loss is the fixed evaluator's probability MSE. It is not bits-per-byte.",
+  "generated_at": "2026-10-24T17:35:18.716817+00:00",
+  "metric_definition": "validation_auroc is the fixed evaluator's AUROC. Higher is better. The replay tracks this metric so sessions can be compared.",
   "decision_recording": "This session does not record a post-evaluation keep, discard, investigate, or failed decision. The text below is the proposal written before training.",
-  "running_best_definition": "best_so_far_loss is the running minimum validation loss among valid experiments, in chronological order. It is not a keep decision.",
+  "running_best_definition": "best_so_far_auroc is the running maximum validation AUROC among valid experiments, in chronological order. It is not a keep decision.",
   "backtrack_definition": "A backtrack is recorded when parent is an earlier experiment id, not the immediately previous experiment. The controller copies that parent's ml.py.",
   "recorded_provider": "openrouter",
   "recorded_model": "recursive/flint-v1.0:free",

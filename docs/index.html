@@ -18,14 +18,14 @@
   <main>
     <section class="stage">
       <div class="stage-head">
-        <h2>Validation loss</h2>
-        <p>Probability MSE from the fixed evaluator. Lower is better. This is not bits-per-byte.</p>
+        <h2>Validation AUROC</h2>
+        <p>Ranking metric from the fixed evaluator. Higher is better, so sessions can be compared on the same scale.</p>
       </div>
-      <svg id="chart" viewBox="0 0 860 520" role="img" aria-label="Validation loss by experiment"></svg>
+      <svg id="chart" viewBox="0 0 860 520" role="img" aria-label="Validation AUROC by experiment"></svg>
       <div class="legend">
         <span><i class="swatch point"></i> Valid evaluation</span>
-        <span><i class="swatch fail"></i> Failed run, no validation loss</span>
-        <span><i class="swatch best"></i> Lowest validation loss so far</span>
+        <span><i class="swatch fail"></i> Failed run, no AUROC</span>
+        <span><i class="swatch best"></i> Highest AUROC so far</span>
         <span><i class="swatch back"></i> Backtrack to an earlier parent</span>
       </div>
       <div class="stage-head lineage-head">
@@ -52,6 +52,14 @@
       </select>
     </label>
     <p id="progress"></p>
+  </section>
+
+  <section class="changelog" aria-label="Model changes">
+    <div class="stage-head">
+      <h2>What the model changed</h2>
+      <p>Each row is the recorded edit for that experiment, added when the run appears in the replay.</p>
+    </div>
+    <ol id="change-log"></ol>
   </section>
 
   <footer>

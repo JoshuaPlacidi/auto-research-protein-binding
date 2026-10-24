@@ -2,6 +2,7 @@ const STEP_MS = 2000;
 const chart = document.querySelector("#chart");
 const lineage = document.querySelector("#lineage");
 const panel = document.querySelector("#panel");
+const changeLog = document.querySelector("#change-log");
 const stats = document.querySelector("#stats");
 const sessionLine = document.querySelector("#session-line");
 const footnote = document.querySelector("#footnote");
@@ -43,18 +44,34 @@ function frameCount() {
   return rows().length + 1;
 }
 
-function lossColor(row) {
+function scoreColor(row) {
   return row.status === "failed" ? "#a33b32" : "#243044";
+}
+
+function aurocLabel(row) {
+  if (row.status === "failed" || row.validation_auroc === null || row.validation_auroc === undefined) return "Failed";
+  const score = fmt(row.validation_auroc, 3);
+  if (row.auroc_vs_parent === null || row.auroc_vs_parent === undefined) return score;
+  const delta = Number(row.auroc_vs_parent);
+  const sign = delta > 0 ? "+" : "";
+  return `${score} (${sign}${delta.toFixed(3)})`;
+}
+
+function raisedBest(row, previous) {
+  if (row.status !== "valid" || row.validation_auroc === null || row.validation_auroc === undefined) return false;
+  if (row.validation_auroc !== row.best_so_far_auroc) return false;
+  if (!previous || previous.best_so_far_auroc === null || previous.best_so_far_auroc === undefined) return true;
+  return row.validation_auroc > previous.best_so_far_auroc;
 }
 
 function renderStats() {
   const data = state.data;
-  const best = data.best_validation_loss_experiment;
+  const best = data.highest_auroc_experiment;
   const cards = [
     ["Valid experiments", String(data.valid_experiments)],
     ["Failed experiments", String(data.failed_experiments)],
     ["Backtracks", String((data.backtracks || []).length)],
-    ["Lowest validation loss", best ? `${fmt(best.validation_loss, 6)} · ${best.experiment_id}` : "Not recorded"],
+    ["Highest AUROC", best ? `${fmt(best.validation_auroc, 3)} · ${best.experiment_id}` : "Not recorded"],
   ];
   stats.innerHTML = cards.map(([label, value]) =>
     `<article class="stat"><b>${value}</b><span>${label}</span></article>`
@@ -64,13 +81,13 @@ function renderStats() {
 function renderChart() {
   const items = rows();
   const visible = items.slice(0, Math.max(0, state.index + 1));
-  const losses = visible.map((row) => row.validation_loss).filter((value) => value !== null);
-  if (!losses.length) {
+  const scores = visible.map((row) => row.validation_auroc).filter((value) => value !== null && value !== undefined);
+  if (!scores.length) {
     chart.innerHTML = `<text class="tick" x="430" y="220" text-anchor="middle">Experiments appear as the replay advances.</text>`;
     return;
   }
-  const allMin = Math.min(...losses);
-  const allMax = Math.max(...losses);
+  const allMin = Math.min(...scores);
+  const allMax = Math.max(...scores);
   const min = allMin;
   const max = allMax;
   const wide = false;
@@ -92,41 +109,41 @@ function renderChart() {
   const grid = ticks.map((tick) => {
     const y = yAt(tick);
     return `<line class="grid" x1="${left}" x2="${width - right}" y1="${y}" y2="${y}"></line>
-      <text class="tick" x="${left - 10}" y="${y + 4}" text-anchor="end">${fmt(tick, 6)}</text>`;
+      <text class="tick" x="${left - 10}" y="${y + 4}" text-anchor="end">${fmt(tick, 3)}</text>`;
   }).join("");
 
-  const bestPoints = visible.filter((row) => row.best_so_far_loss !== null);
+  const bestPoints = visible.filter((row) => row.best_so_far_auroc !== null && row.best_so_far_auroc !== undefined);
   const bestLine = bestPoints.map((row) => {
     const i = items.indexOf(row);
-    return `${xAt(i)},${yAt(row.best_so_far_loss)}`;
+    return `${xAt(i)},${yAt(row.best_so_far_auroc)}`;
   }).join(" ");
 
   const backArcs = visible.filter((row) => row.backtrack).map((row) => {
     const i = items.indexOf(row);
     const parentIndex = items.findIndex((item) => item.experiment_id === row.parent);
     const parent = parentIndex >= 0 ? items[parentIndex] : null;
-    if (!parent || parent.validation_loss === null || row.validation_loss === null) return "";
+    if (!parent || parent.validation_auroc === null || parent.validation_auroc === undefined || row.validation_auroc === null || row.validation_auroc === undefined) return "";
     const lift = Math.min(90, 28 + (i - parentIndex) * 4);
     const x1 = xAt(parentIndex);
-    const y1 = yAt(parent.validation_loss);
+    const y1 = yAt(parent.validation_auroc);
     const x2 = xAt(i);
-    const y2 = yAt(row.validation_loss);
+    const y2 = yAt(row.validation_auroc);
     return `<path class="back-arc" d="M ${x1} ${y1} Q ${(x1 + x2) / 2} ${Math.min(y1, y2) - lift} ${x2} ${y2}"></path>`;
   }).join("");
 
   const dots = visible.map((row) => {
     const i = items.indexOf(row);
     const active = i === state.index ? "active" : "";
-    const loss = row.validation_loss;
+    const score = row.validation_auroc;
     const ring = row.backtrack ? `stroke="#c47b2b" stroke-width="2"` : "";
-    if (loss === null) {
+    if (score === null || score === undefined) {
       const y = height - bottom + 10;
       return `<rect class="dot ${active}" data-index="${i}" x="${xAt(i) - 4}" y="${y}" width="8" height="8" fill="#a33b32"></rect>`;
     }
     const label = i === state.index
-      ? `<text class="tick" x="${xAt(i)}" y="${Math.max(16, yAt(loss) - 12)}" text-anchor="middle">${fmt(loss, 4)}</text>`
+      ? `<text class="tick" x="${xAt(i)}" y="${Math.max(16, yAt(score) - 12)}" text-anchor="middle">${fmt(score, 3)}</text>`
       : "";
-    return `${label}<circle class="dot ${active}" data-index="${i}" cx="${xAt(i)}" cy="${yAt(loss)}" r="${i === state.index ? 7 : 5}" fill="${lossColor(row)}" ${ring}></circle>`;
+    return `${label}<circle class="dot ${active}" data-index="${i}" cx="${xAt(i)}" cy="${yAt(score)}" r="${i === state.index ? 7 : 5}" fill="${scoreColor(row)}" ${ring}></circle>`;
   }).join("");
 
   let inset = "";
@@ -140,11 +157,11 @@ function renderChart() {
     const cy1 = clusterMax + cSpan * 0.35;
     const insetX = (i) => ix + 28 + (items.length === 1 ? (iw - 36) / 2 : (i / (items.length - 1)) * (iw - 36));
     const insetY = (loss) => iy + 16 + ((cy1 - Math.min(loss, cy1)) / (cy1 - cy0)) * (ih - 28);
-    const insetLine = bestPoints.map((row) => `${insetX(items.indexOf(row))},${insetY(row.best_so_far_loss)}`).join(" ");
+    const insetLine = bestPoints.map((row) => `${insetX(items.indexOf(row))},${insetY(row.best_so_far_auroc)}`).join(" ");
     const insetDots = visible.map((row) => {
-      if (row.validation_loss === null || row.validation_loss - allMin >= 0.01) return "";
+      if (row.validation_auroc === null || row.validation_auroc === undefined || row.validation_auroc - allMin >= 0.01) return "";
       const i = items.indexOf(row);
-      return `<circle data-index="${i}" class="dot" cx="${insetX(i)}" cy="${insetY(row.validation_loss)}" r="3.5" fill="${lossColor(row)}"></circle>`;
+      return `<circle data-index="${i}" class="dot" cx="${insetX(i)}" cy="${insetY(row.validation_auroc)}" r="3.5" fill="${scoreColor(row)}"></circle>`;
     }).join("");
     inset = `
       <rect x="${ix}" y="${iy}" width="${iw}" height="${ih}" rx="10" fill="#fffdf8" stroke="#e2d9cc"></rect>
@@ -167,7 +184,7 @@ function renderChart() {
     ${dots}
     ${inset}
     ${labels}
-    <text class="tick" x="16" y="${top + 8}">loss</text>
+    <text class="tick" x="16" y="${top + 8}">AUROC</text>
   `;
   chart.querySelectorAll(".dot").forEach((dot) => {
     dot.addEventListener("click", () => {
@@ -243,14 +260,12 @@ function renderPanel() {
     return;
   }
   if (state.index >= items.length) {
-    const best = state.data.best_validation_loss_experiment;
-    const auroc = state.data.highest_auroc_experiment;
+    const best = state.data.highest_auroc_experiment;
     panel.innerHTML = `
       <p class="eyebrow">Replay complete</p>
-      <h2>Lowest recorded loss</h2>
-      <p>Experiment ${esc(best.experiment_id)} has the lowest validation loss in this session, ${fmt(best.validation_loss, 6)}, with AUROC ${fmt(best.validation_auroc, 4)}.</p>
-      <p class="note">Highest recorded AUROC is experiment ${esc(auroc.experiment_id)} at ${fmt(auroc.validation_auroc, 4)}. These are measured ranks, not keep decisions.</p>
-      <p class="note">${(state.data.backtracks || []).length} experiments record a parent earlier than the previous experiment. Post-experiment keep or discard decisions: Not recorded.</p>
+      <h2>Highest recorded AUROC</h2>
+      <p>Experiment ${esc(best.experiment_id)} has the highest validation AUROC in this session, ${fmt(best.validation_auroc, 3)}.</p>
+      <p class="note">That rank is the measured AUROC, not a keep decision. ${(state.data.backtracks || []).length} experiments record a parent earlier than the previous experiment.</p>
       <p class="note">${state.data.decision_recording}</p>
     `;
     return;
@@ -272,14 +287,14 @@ function renderPanel() {
     ${row.error ? `<p class="note">Recorded error: ${esc(row.error)}</p>` : ""}
     <h3>Evaluation</h3>
     <div class="metrics">
-      ${metricCard("Validation loss", fmt(row.validation_loss, 8))}
-      ${metricCard("AUROC", fmt(row.validation_auroc, 4))}
-      ${metricCard("AUPRC", fmt(row.validation_auprc, 4))}
-      ${metricCard("Peptide-macro AUROC", fmt(row.peptide_macro_auroc, 4))}
-      ${metricCard("Unseen HLA AUROC", `${fmt(row.unseen_hla_auroc, 4)} (n=${row.unseen_hla_n ?? "Not recorded"})`)}
+      ${metricCard("AUROC", fmt(row.validation_auroc, 3))}
+      ${metricCard("AUROC versus parent", fmt(row.auroc_vs_parent, 3))}
+      ${metricCard("AUPRC", fmt(row.validation_auprc, 3))}
+      ${metricCard("Peptide-macro AUROC", fmt(row.peptide_macro_auroc, 3))}
+      ${metricCard("Unseen HLA AUROC", `${fmt(row.unseen_hla_auroc, 3)} (n=${row.unseen_hla_n ?? "Not recorded"})`)}
+      ${metricCard("Validation loss", fmt(row.validation_loss, 4))}
       ${metricCard("Epochs completed / planned", `${row.epochs_completed ?? "Not recorded"} / ${row.epochs_planned ?? "Not recorded"}`)}
       ${metricCard("Training seconds", fmt(row.runtime_seconds, 1))}
-      ${metricCard("Loss versus parent", fmt(row.loss_vs_parent, 6))}
       ${metricCard("Proposal prompt tokens", fmtInt(row.proposal_prompt_tokens))}
     </div>
     <h3>Decision</h3>
@@ -290,6 +305,36 @@ function renderPanel() {
     <h3>Recorded evidence for the proposal</h3>
     <p>${esc(row.proposal_evidence)}</p>
   `;
+}
+
+function renderChangeLog() {
+  const items = rows();
+  const last = state.index < 0 ? -1 : Math.min(state.index, items.length - 1);
+  if (last < 0) {
+    changeLog.innerHTML = `<li class="change-empty">Changes appear here as each experiment is replayed.</li>`;
+    return;
+  }
+  const visible = items.slice(0, last + 1);
+  changeLog.innerHTML = visible.map((row, index) => {
+    const previous = index > 0 ? visible[index - 1] : null;
+    const classes = ["change-row"];
+    if (index === state.index) classes.push("current");
+    if (row.status === "failed") classes.push("failed");
+    else if (raisedBest(row, previous)) classes.push("best");
+    return `<li class="${classes.join(" ")}" data-index="${index}">
+      <span class="id">${esc(row.experiment_id)}</span>
+      <span class="score">${esc(aurocLabel(row))}</span>
+      <p>${esc(row.change_summary)}</p>
+    </li>`;
+  }).join("");
+  changeLog.querySelectorAll(".change-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      pause();
+      show(Number(row.dataset.index));
+    });
+  });
+  const current = changeLog.querySelector(".current") || changeLog.querySelector(".change-row:last-child");
+  if (current) changeLog.scrollTop = Math.max(0, current.offsetTop - changeLog.clientHeight + current.offsetHeight + 8);
 }
 
 function renderProgress() {
@@ -304,6 +349,7 @@ function show(index) {
   renderChart();
   renderLineage();
   renderPanel();
+  renderChangeLog();
   renderProgress();
 }
 
@@ -359,9 +405,9 @@ fetch("./data/experiments.json")
   .then((response) => response.json())
   .then((data) => {
     state.data = data;
-    const best = data.best_validation_loss_experiment;
+    const best = data.highest_auroc_experiment;
     sessionLine.textContent = `Session ${data.session_id}. Recorded model ${data.recorded_model} via ${data.recorded_provider}. ${data.excluded.length} incomplete experiment${data.excluded.length === 1 ? "" : "s"} excluded.`;
-    footnote.textContent = `${data.metric_definition} ${data.running_best_definition} ${data.backtrack_definition} Lowest loss is experiment ${best.experiment_id}. Excluded: ${data.excluded.map((row) => `${row.experiment_id} (${row.status})`).join(", ") || "none"}.`;
+    footnote.textContent = `${data.metric_definition} ${data.running_best_definition} ${data.backtrack_definition} Highest AUROC is experiment ${best.experiment_id}. Excluded: ${data.excluded.map((row) => `${row.experiment_id} (${row.status})`).join(", ") || "none"}.`;
     renderStats();
     show(-1);
     play();
