@@ -1,17 +1,22 @@
-"""Bounded Argon research controller; run from the repository root.
+"""Bounded research controller; run from the repository root.
 
     python agent/agent.py --dry-run
     python agent/agent.py --max-experiments 2 --run-timeout 900
     python agent/agent.py --resume --max-experiments 2
+    python agent/agent.py --provider openrouter --model vendor/name --max-input-tokens 100000 --max-output-tokens 8192
 
-Two experiments means baseline setup/training plus ONE proposed modification.
-Only this controller writes model proposals to ml.py; all history stays in
-experiments/evaluation.log. Checkpoints are generated training outputs.
-This is an orchestration boundary, not an OS sandbox for generated Python.
+A launch creates experiments/<session>/ and keeps that trace's copies, logs and
+checkpoints inside it. summary.json and summary.csv in that directory are rebuilt
+from the experiment logs after each attempt: what changed, and the headline
+validation metrics. Another launch starts a separate trace. --resume continues
+the latest trace; --session NAME continues a named one. The repository ml.py is
+never written. This is an orchestration boundary, not an OS sandbox for generated Python.
 """
 import argparse
 import ast
+import csv
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -19,47 +24,135 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
-LOG = ROOT / "experiments/evaluation.log"
+EXPERIMENTS = ROOT / "experiments"
+LOCK_PATH = EXPERIMENTS / ".lock"
+ACTIVE_PATH = EXPERIMENTS / "active"
+STARTER = ROOT / "ml.py"
+SESSION_DIR = None
 SESSION_STARTED_AT = None
+MAX_EDITS = 8
+HIGHLIGHT_GROUPS = (
+    "unseen_tcr", "unseen_peptide", "unseen_hla", "unseen_pmhc",
+    "unseen_tcr_and_pmhc", "completely_unseen_tcr_peptide_hla", "fully_seen_components",
+)
+_GROUP_METRICS = ("auroc", "auprc")
+_SUMMARY_COLUMNS = (
+    "session_id", "experiment_id", "timestamp", "status", "parent", "n_edits",
+    "hypothesis", "change",
+    "validation_loss", "auroc", "auprc", "accuracy", "binary_log_loss",
+    "peptide_macro_auroc", "peptide_macro_auprc",
+    "n", "n_positive", "n_negative",
+    "best_validation_loss", "best_auroc", "loss_vs_parent", "auroc_vs_parent",
+    "epochs_completed", "epochs_planned", "learning_rate", "training_objective",
+    "train_runtime_seconds", "final_train_loss",
+    *[f"{name}_{metric}" for name in HIGHLIGHT_GROUPS for metric in _GROUP_METRICS],
+    "error",
+)
 
 
 class StopRequested(Exception):
-    """A configured budget, patience limit or operator request ended the search."""
+    """A configured budget or operator request ended the search."""
+
+
+def controller_log():
+    return SESSION_DIR / "controller.jsonl"
 
 
 def check_stop():
-    if SESSION_STARTED_AT is not None:
-        for record in reversed(read_records()):
-            if record.get("event") == "stop_requested" and record.get("timestamp", "") >= SESSION_STARTED_AT:
-                raise StopRequested("Operator requested a stop through the shared log")
+    if SESSION_STARTED_AT is None or SESSION_DIR is None:
+        return
+    for record in reversed(read_records(controller_log())):
+        if record.get("event") == "stop_requested" and record.get("timestamp", "") >= SESSION_STARTED_AT:
+            raise StopRequested("Operator requested a stop through the controller log")
 
 
-def append_log(event, **fields):
-    LOG.parent.mkdir(parents=True, exist_ok=True)
+def say(text=""):
+    print(text, flush=True)
+
+
+def preview_lines(text, limit=8):
+    lines = text.splitlines() or [""]
+    shown = []
+    for line in lines[:limit]:
+        shown.append(line if len(line) <= 160 else line[:157] + "...")
+    if len(lines) > limit:
+        shown.append(f"... {len(lines) - limit} more lines")
+    return shown
+
+
+def show_proposal(proposal):
+    say(f"  parent  {proposal['parent']}")
+    brief = " ".join(proposal["change"].split())
+    say(f"  change  {brief if len(brief) <= 240 else brief[:237] + '...'}")
+    edits = proposal.get("edits") or []
+    if not edits:
+        say("  edits   none")
+        return
+    say(f"  edits   {len(edits)}")
+    for index, edit in enumerate(edits, 1):
+        say(f"  --- {index}")
+        for line in preview_lines(edit.get("old", "")):
+            say(f"  - {line}")
+        for line in preview_lines(edit.get("new", "")):
+            say(f"  + {line}")
+
+
+def metric_text(value):
+    return "—" if value is None else f"{value:.4f}"
+
+
+def show_result(experiment_id, record):
+    if record:
+        overall = (record.get("metrics") or {}).get("overall") or {}
+        metrics = record.get("metrics") or {}
+        say(f"  result  loss {metric_text(overall.get('validation_loss'))}"
+            f"  auroc {metric_text(overall.get('auroc'))}"
+            f"  auprc {metric_text(overall.get('auprc'))}"
+            f"  macro {metric_text(metrics.get('peptide_macro_auroc'))}/{metric_text(metrics.get('peptide_macro_auprc'))}")
+    say("  trace")
+    for directory in experiment_dirs():
+        evaluations = [r for r in read_records(directory / "log.jsonl")
+                       if r.get("event") == "model_evaluation" and r.get("status") == "valid"]
+        if evaluations:
+            row = evaluations[-1].get("metrics", {}).get("overall", {})
+            mark = "*" if directory.name == experiment_id else " "
+            say(f"   {mark} {directory.name}  loss {metric_text(row.get('validation_loss'))}"
+                f"  auroc {metric_text(row.get('auroc'))}  auprc {metric_text(row.get('auprc'))}")
+        elif directory.name == experiment_id or any(
+                r.get("event") == "experiment_failure" for r in read_records(directory / "log.jsonl")):
+            mark = "*" if directory.name == experiment_id else " "
+            say(f"   {mark} {directory.name}  failed")
+
+
+def append_log(path, event, **fields):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     record = {"event": event, "timestamp": datetime.now(timezone.utc).isoformat(), **fields}
-    with LOG.open("a", encoding="utf-8") as handle:
+    with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, allow_nan=False, sort_keys=True) + "\n")
     return record
 
 
-def read_full_history():
-    """Never summarise, select recent entries or silently truncate this text."""
-    return LOG.read_text(encoding="utf-8") if LOG.exists() else ""
+def read_full_history(path):
+    path = Path(path)
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
-def read_records():
+def read_records(path):
     records = []
-    for line in read_full_history().splitlines():
+    for line in read_full_history(path).splitlines():
         try:
             value = json.loads(line)
             if isinstance(value, dict):
                 records.append(value)
         except json.JSONDecodeError:
-            pass  # Human-written log lines still enter every API prompt.
+            pass
     return records
 
 
@@ -73,6 +166,238 @@ def digest(path):
 
 def source_hash(source):
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def session_directories():
+    if not EXPERIMENTS.is_dir():
+        return []
+    return [path for path in sorted(EXPERIMENTS.iterdir())
+            if path.is_dir() and (path / "controller.jsonl").is_file()]
+
+
+def experiment_dirs():
+    if SESSION_DIR is None or not SESSION_DIR.is_dir():
+        return []
+    return [path for path in sorted(SESSION_DIR.iterdir())
+            if path.is_dir() and (path / "ml.py").is_file()]
+
+
+def _last_event(records, event, **match):
+    found = None
+    for record in records:
+        if record.get("event") != event:
+            continue
+        if all(record.get(key) == value for key, value in match.items()):
+            found = record
+    return found
+
+
+def _number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    if isinstance(value, float) and (value != value or abs(value) == float("inf")):
+        return None
+    return value
+
+
+def _first_timestamp(*records):
+    for record in records:
+        if record and record.get("timestamp"):
+            return record["timestamp"]
+    return None
+
+
+def _group_metrics(summary):
+    if not isinstance(summary, dict):
+        return None
+    return {key: _number(summary.get(key)) for key in ("n", "validation_loss", "auroc", "auprc")}
+
+
+def summarize_experiment(directory):
+    """One experiment row: the model's stated change and headline validation metrics."""
+    records = read_records(directory / "log.jsonl")
+    proposal = _last_event(records, "proposal") or {}
+    evaluation = _last_event(records, "model_evaluation")
+    failure = _last_event(records, "experiment_failure")
+    config = _last_event(records, "training_configuration") or {}
+    epochs = [record for record in records if record.get("event") == "training_epoch"]
+    training_run = _last_event(records, "execution", stage="training")
+    failed_after = failure and evaluation and failure.get("timestamp", "") > evaluation.get("timestamp", "")
+    valid = bool(evaluation and evaluation.get("status") == "valid" and not failed_after)
+    if valid:
+        status, error = "valid", None
+    elif failure or evaluation:
+        status = "failed"
+        error = (failure or evaluation).get("error")
+    else:
+        status, error = "incomplete", None
+    report = (evaluation or {}).get("metrics") or {}
+    overall = report.get("overall") or {}
+    metrics = groups = provided = None
+    if valid:
+        metrics = {
+            "validation_loss": _number(overall.get("validation_loss")),
+            "auroc": _number(overall.get("auroc")),
+            "auprc": _number(overall.get("auprc")),
+            "accuracy": _number(overall.get("accuracy")),
+            "binary_log_loss": _number(overall.get("binary_log_loss")),
+            "peptide_macro_auroc": _number(report.get("peptide_macro_auroc")),
+            "peptide_macro_auprc": _number(report.get("peptide_macro_auprc")),
+            "n": overall.get("n"),
+            "n_positive": overall.get("n_positive"),
+            "n_negative": overall.get("n_negative"),
+        }
+        derived = report.get("derived_categories") or {}
+        groups = {name: _group_metrics(derived[name])
+                  for name in HIGHLIGHT_GROUPS if isinstance(derived.get(name), dict)} or None
+        raw_provided = report.get("provided_categories") or {}
+        if isinstance(raw_provided, dict) and raw_provided:
+            provided = {name: _group_metrics(value) for name, value in raw_provided.items()
+                        if isinstance(value, dict)} or None
+    final_epoch = epochs[-1] if epochs else {}
+    training = None
+    if config or epochs or training_run:
+        training = {
+            "epochs_planned": config.get("epochs"),
+            "epochs_completed": len(epochs),
+            "learning_rate": config.get("learning_rate"),
+            "loss": config.get("loss"),
+            "batch_size": config.get("batch_size"),
+            "seed": config.get("seed"),
+            "runtime_seconds": None if training_run is None else training_run.get("runtime_seconds"),
+            "final_train_loss": _number(final_epoch.get("train_loss")),
+            "final_validation_loss": _number(final_epoch.get("validation_loss")),
+        }
+    edits = proposal.get("edits")
+    return {
+        "experiment_id": directory.name,
+        "timestamp": _first_timestamp(evaluation, failure, proposal, records[-1] if records else None),
+        "status": status,
+        "parent": proposal.get("parent"),
+        "hypothesis": proposal.get("hypothesis"),
+        "evidence": proposal.get("evidence"),
+        "change": proposal.get("change"),
+        "n_edits": len(edits) if isinstance(edits, list) else None,
+        "error": error,
+        "training": training,
+        "metrics": metrics,
+        "groups": groups,
+        "provided_categories": provided,
+    }
+
+
+def _annotate_summary(rows):
+    by_id = {row["experiment_id"]: row for row in rows}
+    best_loss = best_auroc = None
+    for row in rows:
+        metrics = row.get("metrics") or {}
+        loss, auroc = metrics.get("validation_loss"), metrics.get("auroc")
+        if row["status"] == "valid":
+            if loss is not None:
+                best_loss = loss if best_loss is None else min(best_loss, loss)
+            if auroc is not None:
+                best_auroc = auroc if best_auroc is None else max(best_auroc, auroc)
+        parent_metrics = (by_id.get(row.get("parent")) or {}).get("metrics") or {}
+        parent_loss, parent_auroc = parent_metrics.get("validation_loss"), parent_metrics.get("auroc")
+        row["best_validation_loss"] = best_loss
+        row["best_auroc"] = best_auroc
+        row["loss_vs_parent"] = None if loss is None or parent_loss is None else loss - parent_loss
+        row["auroc_vs_parent"] = None if auroc is None or parent_auroc is None else auroc - parent_auroc
+    return rows
+
+
+def _flat_summary_row(session_id, row):
+    metrics = row.get("metrics") or {}
+    training = row.get("training") or {}
+    groups = row.get("groups") or {}
+    flat = {
+        "session_id": session_id,
+        "experiment_id": row["experiment_id"],
+        "timestamp": row["timestamp"],
+        "status": row["status"],
+        "parent": row["parent"],
+        "n_edits": row["n_edits"],
+        "hypothesis": row.get("hypothesis"),
+        "change": row.get("change"),
+        "validation_loss": metrics.get("validation_loss"),
+        "auroc": metrics.get("auroc"),
+        "auprc": metrics.get("auprc"),
+        "accuracy": metrics.get("accuracy"),
+        "binary_log_loss": metrics.get("binary_log_loss"),
+        "peptide_macro_auroc": metrics.get("peptide_macro_auroc"),
+        "peptide_macro_auprc": metrics.get("peptide_macro_auprc"),
+        "n": metrics.get("n"),
+        "n_positive": metrics.get("n_positive"),
+        "n_negative": metrics.get("n_negative"),
+        "best_validation_loss": row.get("best_validation_loss"),
+        "best_auroc": row.get("best_auroc"),
+        "loss_vs_parent": row.get("loss_vs_parent"),
+        "auroc_vs_parent": row.get("auroc_vs_parent"),
+        "epochs_completed": training.get("epochs_completed"),
+        "epochs_planned": training.get("epochs_planned"),
+        "learning_rate": training.get("learning_rate"),
+        "training_objective": training.get("loss"),
+        "train_runtime_seconds": training.get("runtime_seconds"),
+        "final_train_loss": training.get("final_train_loss"),
+        "error": row.get("error"),
+    }
+    for name in HIGHLIGHT_GROUPS:
+        group = groups.get(name) or {}
+        for metric in _GROUP_METRICS:
+            flat[f"{name}_{metric}"] = group.get(metric)
+    return flat
+
+
+def _atomic_text(path, text):
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
+def write_session_summary(session_dir=None):
+    """Rebuild summary.json and summary.csv from the experiment logs in one session.
+
+    The per-experiment logs remain the research record. This table is derived:
+    one row per experiment, in id order, safe to rebuild on resume.
+    """
+    session_dir = Path(session_dir) if session_dir is not None else SESSION_DIR
+    if session_dir is None or not session_dir.is_dir():
+        return None
+    directories = [path for path in sorted(session_dir.iterdir())
+                   if path.is_dir() and path.name.isdigit()]
+    rows = _annotate_summary([summarize_experiment(path) for path in directories])
+    payload = {"session_id": session_dir.name,
+               "updated_at": datetime.now(timezone.utc).isoformat(),
+               "experiments": rows}
+    _atomic_text(session_dir / "summary.json", json.dumps(payload, indent=2, allow_nan=False) + "\n")
+    lines = io.StringIO()
+    writer = csv.DictWriter(lines, fieldnames=_SUMMARY_COLUMNS, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        flat = _flat_summary_row(session_dir.name, row)
+        writer.writerow({key: "" if flat.get(key) is None else flat[key] for key in _SUMMARY_COLUMNS})
+    csv_path = session_dir / "summary.csv"
+    _atomic_text(csv_path, lines.getvalue())
+    return csv_path
+
+
+def publish_session_summary(announce=False):
+    try:
+        path = write_session_summary()
+    except Exception as exc:
+        say(f"summary failed  {exc}")
+        return
+    if announce and path is not None:
+        say(f"summary  {path.relative_to(ROOT)}")
+
+
+def next_experiment_id():
+    numbers = []
+    if SESSION_DIR is not None and SESSION_DIR.is_dir():
+        for path in SESSION_DIR.iterdir():
+            if path.is_dir() and path.name.isdigit():
+                numbers.append(int(path.name))
+    return f"{(max(numbers) if numbers else 0) + 1:04d}"
 
 
 def inspect_environment():
@@ -104,14 +429,21 @@ def inspect_environment():
         paths.append(path)
     if paths[0] == paths[1] or summary["TRAIN_PATH"]["sha256"] == summary["VALIDATION_PATH"]["sha256"]:
         raise ValueError("Training and validation must be different datasets")
-    # Test data is neither opened nor included in the API context.
     return summary, paths
 
 
+CONTROLLER_FILES = ("ml.py", "final_eval.py", "objective.md", "agent/agent.py", "pyproject.toml", "uv.lock", ".env")
+
+
 def protected_hashes(data_paths):
-    paths = [ROOT / name for name in ("eval.py", "final_eval.py", "objective.md", "agent/agent.py",
-                                      "pyproject.toml", "uv.lock", ".env")]
+    paths = [ROOT / "eval.py", *[ROOT / name for name in CONTROLLER_FILES]]
     return {str(p): digest(p) for p in paths + data_paths if p.is_file()}
+
+
+def experiment_contract(protocol):
+    """Evaluator and dataset hashes. A controller or objective edit can still resume."""
+    ignored = {str(ROOT / name) for name in CONTROLLER_FILES}
+    return {path: sha for path, sha in protocol.items() if path not in ignored}
 
 
 def assert_unchanged(expected):
@@ -120,20 +452,82 @@ def assert_unchanged(expected):
             raise RuntimeError(f"Protected input changed: {Path(path).name}; stopping")
 
 
-def build_context(task, data_summary, incumbent):
-    """Fresh request, including objective, fixed evaluator, source and ENTIRE log."""
+def research_dirs():
+    if SESSION_DIR is None or not SESSION_DIR.is_dir():
+        return []
+    return [path for path in sorted(SESSION_DIR.iterdir())
+            if path.is_dir() and (path / "log.jsonl").is_file()]
+
+
+def prompt_data_summary(summary):
+    keys = ("rows", "eligible_full_chain", "positive", "negative", "max_lengths")
+    return {name: {key: info[key] for key in keys if key in info} for name, info in summary.items()}
+
+
+def compact_group(row):
+    if not isinstance(row, dict):
+        return row
+    return {key: row.get(key) for key in ("n", "n_positive", "validation_loss", "auroc", "auprc")}
+
+
+def compact_groups(groups):
+    if not isinstance(groups, dict):
+        return groups
+    return {name: compact_group(row) for name, row in groups.items()}
+
+
+def experiment_history(directory):
+    """Proposal, epoch losses and summary metrics. Per-peptide tables stay on disk."""
+    entry = {"id": directory.name}
+    epochs = []
+    for record in read_records(directory / "log.jsonl"):
+        event = record.get("event")
+        if event == "proposal":
+            for key in ("parent", "hypothesis", "change", "edits"):
+                if key in record:
+                    entry[key] = record[key]
+        elif event == "training_epoch":
+            epochs.append({key: record.get(key) for key in ("epoch", "train_loss", "validation_loss")})
+        elif event == "model_evaluation":
+            metrics = record.get("metrics") or {}
+            overall = metrics.get("overall") if isinstance(metrics.get("overall"), dict) else {}
+            entry["metrics"] = {
+                "overall": {key: overall.get(key) for key in ("validation_loss", "auroc", "auprc")},
+                "peptide_macro_auroc": metrics.get("peptide_macro_auroc"),
+                "peptide_macro_auprc": metrics.get("peptide_macro_auprc"),
+                "peptide_coverage": metrics.get("peptide_coverage"),
+                "provided_categories": compact_groups(metrics.get("provided_categories")),
+                "derived_categories": compact_groups(metrics.get("derived_categories")),
+            }
+        elif event == "experiment_failure":
+            entry["error"] = record.get("error")
+    if epochs:
+        entry["epochs"] = epochs
+    return entry
+
+
+def build_context(task, data_summary):
+    """Objective, source files the model may patch, and a condensed experiment history."""
+    sources = {"starter": STARTER.read_text(encoding="utf-8")}
+    history = []
+    for directory in research_dirs():
+        history.append(experiment_history(directory))
+        source = directory / "ml.py"
+        if source.is_file():
+            sources[directory.name] = source.read_text(encoding="utf-8")
     return json.dumps({
         "task": task,
         "objective": (ROOT / "objective.md").read_text(encoding="utf-8"),
-        "fixed_evaluator": (ROOT / "eval.py").read_text(encoding="utf-8"),
-        "current_ml_py": (ROOT / "ml.py").read_text(encoding="utf-8"),
-        "data_summary_only": data_summary,
-        "incumbent": incumbent,
-        "full_untruncated_research_log": read_full_history(),
+        "sources": sources,
+        "history": history,
+        "data_summary": prompt_data_summary(data_summary),
         "controller_contract": (
             "Respond only in the requested JSON schema. You have no shell or file tools. "
-            "The controller applies only the ml_py string to ml.py. Do not generate other source files, "
-            "change evaluator/data/dependencies/controller, access test data, or make API/network calls from ml.py. "
+            "The controller copies the named parent ml.py into a new experiment directory and applies edits. "
+            "parent is starter or an existing experiment id. edits is an ordered list of {old, new} strings; "
+            "each old must occur exactly once in the parent file; at most 8 edits; an empty list copies the parent unchanged. "
+            "Do not return a full ml.py. Do not change evaluator/data/dependencies/controller, access test data, "
+            "or make API/network calls from ml.py. "
             "Keep Dataset.data in original CSV order; select eligible full-chain rows with Subset for training. "
             "Validate chain boundaries and use complete untruncated alpha+beta, peptide and HLA sequences. "
             "Maintain Model(), Dataset(path), main(), and forward(peptide,hla,tcr) interfaces. "
@@ -142,9 +536,7 @@ def build_context(task, data_summary, incumbent):
             "Append aggregate-only training events to RESEARCH_LOG_PATH. Never print/log raw rows, "
             "patient information, sequence tables, secrets, or create training.log/summary/plot files. "
             "CPU/GPU use must respect the operator's environment and scheduler allocation. "
-            "Base scientific decisions on all reported metrics and full history, not solely the lowest MSE. "
-            "For investigate/discard/failed, the controller restores the incumbent; keep promotes the candidate. "
-            "Investigate means record the uncertainty and propose a controlled follow-up next. "
+            "Base the next parent choice on all reported metrics and full history, not solely the lowest MSE. "
             "No training occurs during imports. No package installs or subprocess launches in generated ml.py. "
             "Preserve checkpoint saving: initial_model.pth after initialisation, last_model.pth every epoch "
             "and in a finally block, model.pth for the chosen validation checkpoint. Save atomically. "
@@ -154,37 +546,85 @@ def build_context(task, data_summary, incumbent):
 
 
 class ArgonClient:
-    """Count context first, then request structured JSON, with a hard API-call cap."""
+    """One research client. Gemini counts tokens then requests JSON; OpenRouter sends one structured chat completion."""
     def __init__(self, args, deadline):
-        from google import genai
-        self.client = genai.Client(http_options={"timeout": int(args.api_timeout * 1000),
-                                                "retry_options": {"attempts": 1}})
         self.args, self.deadline, self.calls = args, deadline, 0
+        self.provider = args.provider
+        self.client = None
+        self._openrouter_key = None
+        if self.provider == "gemini":
+            from google import genai
+            self.client = genai.Client(http_options={"timeout": int(args.api_timeout * 1000),
+                                                    "retry_options": {"attempts": 1}})
+        elif self.provider == "openrouter":
+            key = os.getenv("OPENROUTER_API_KEY", "").strip()
+            if not key:
+                raise RuntimeError("Set OPENROUTER_API_KEY in the environment or repository .env")
+            self._openrouter_key = key
+        else:
+            raise ValueError(f"Unknown provider: {self.provider}")
 
     def close(self):
-        self.client.close()
+        if self.client is not None:
+            self.client.close()
 
-    def call(self, method, **kwargs):
+    def _begin_call(self):
         check_stop()
-        if self.calls >= self.args.max_api_calls:
-            raise StopRequested("API-call budget exhausted")
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise StopRequested("Session runtime budget exhausted")
-        # Request-level timeout is also bounded by the remaining session time.
+        self.calls += 1
+        return remaining
+
+    def call(self, method, **kwargs):
+        remaining = self._begin_call()
         kwargs.setdefault("config", {})["http_options"] = {
             "timeout": max(1, int(min(self.args.api_timeout, remaining) * 1000))}
-        self.calls += 1
         return getattr(self.client.models, method)(model=self.args.model, **kwargs)
 
-    def ask(self, prompt, schema, phase, experiment_id):
-        tokens = self.call("count_tokens", contents=prompt).total_tokens
-        if tokens is None or tokens + 2048 > self.args.max_input_tokens or tokens + 2048 + self.args.max_output_tokens > 1048576:
+    def ask(self, prompt, schema, phase, experiment_id, log_path):
+        if self.provider == "openrouter" and not self.args.openrouter_strict:
+            prompt += "\n\nReturn one JSON object matching this schema and no other text:\n" + json.dumps(schema)
+        tokens, count_method = self._count_input(prompt)
+        self._check_input_budget(tokens)
+        append_log(log_path, "api_request", experiment_id=experiment_id, phase=phase, provider=self.provider,
+                   input_tokens=tokens, input_token_count_method=count_method,
+                   context_sha256=source_hash(prompt), api_calls_used=self.calls,
+                   thinking_level=self.args.thinking_level if self.provider == "gemini" else None,
+                   max_output_tokens=self.args.max_output_tokens)
+        text, finishes, token_usage = self._generate(prompt, schema, phase)
+        append_log(log_path, "api_response", experiment_id=experiment_id, phase=phase, provider=self.provider,
+                   finish_reasons=finishes, token_usage=token_usage)
+        who = "Argon" if self.provider == "gemini" else "OpenRouter"
+        if self._output_truncated(finishes):
+            raise ValueError(f"{who} reached its thinking/output cap; no partial model code will be applied")
+        if not text:
+            raise ValueError(f"{who} returned no JSON text")
+        if self.provider == "openrouter":
+            text = self._unwrap_json(text)
+        result = json.loads(text)
+        if not isinstance(result, dict):
+            raise ValueError(f"{who} response must be a JSON object")
+        return result
+
+    def _count_input(self, prompt):
+        if self.provider == "openrouter":
+            return max(1, (len(prompt.encode("utf-8")) + 2) // 3), "estimate_utf8_div3"
+        return self.call("count_tokens", contents=prompt).total_tokens, "gemini_count_tokens"
+
+    def _check_input_budget(self, tokens):
+        over_cap = tokens is None or tokens + 2048 > self.args.max_input_tokens
+        over_window = (self.provider == "gemini" and
+                       (tokens is None or tokens + 2048 + self.args.max_output_tokens > 1048576))
+        if over_cap or over_window:
             raise RuntimeError("Full history exceeds input-token budget; no truncation performed")
-        append_log("api_request", experiment_id=experiment_id, phase=phase,
-                   input_tokens=tokens, context_sha256=source_hash(prompt),
-                   full_history_included=True, api_calls_used=self.calls,
-                   thinking_level=self.args.thinking_level, max_output_tokens=self.args.max_output_tokens)
+
+    def _generate(self, prompt, schema, phase):
+        if self.provider == "openrouter":
+            return self._generate_openrouter(prompt, schema, phase)
+        return self._generate_gemini(prompt, schema)
+
+    def _generate_gemini(self, prompt, schema):
         response = self.call("generate_content", contents=prompt, config={
             "response_mime_type": "application/json", "response_json_schema": schema,
             "max_output_tokens": self.args.max_output_tokens,
@@ -193,29 +633,132 @@ class ArgonClient:
         usage = getattr(response, "usage_metadata", None)
         finishes = [str(getattr(candidate, "finish_reason", ""))
                     for candidate in (getattr(response, "candidates", None) or [])]
-        append_log("api_response", experiment_id=experiment_id, phase=phase,
-                   finish_reasons=finishes,
-                   token_usage={key: getattr(usage, key, None) for key in
-                                ("prompt_token_count", "candidates_token_count",
-                                 "thoughts_token_count", "total_token_count")})
-        if any("MAX_TOKENS" in reason for reason in finishes):
-            raise ValueError("Argon reached its thinking/output cap; no partial model code will be applied")
-        if not response.text:
-            raise ValueError("Argon returned no JSON text")
-        result = json.loads(response.text)
-        if not isinstance(result, dict):
-            raise ValueError("Argon response must be a JSON object")
-        return result
+        token_usage = {key: getattr(usage, key, None) for key in
+                       ("prompt_token_count", "candidates_token_count",
+                        "thoughts_token_count", "total_token_count")}
+        return response.text, finishes, token_usage
+
+    def _openrouter_payload(self, prompt, schema, phase):
+        if self.args.openrouter_strict:
+            wired = dict(schema)
+            wired["additionalProperties"] = False
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "proposal" if phase == "proposal" else "decision",
+                    "strict": True,
+                    "schema": wired,
+                },
+            }
+        else:
+            response_format = {"type": "json_object"}
+        return {
+            "model": self.args.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.args.max_output_tokens,
+            "response_format": response_format,
+            "provider": {"require_parameters": True},
+            "plugins": [{"id": "context-compression", "enabled": False}],
+        }
+
+    def _generate_openrouter(self, prompt, schema, phase):
+        remaining = self._begin_call()
+        timeout = max(1.0, min(self.args.api_timeout, remaining))
+        request = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps(self._openrouter_payload(prompt, schema, phase), ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self._openrouter_key}",
+                "Content-Type": "application/json",
+                "X-Title": "auto-research-protein-binding",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise ValueError(f"OpenRouter HTTP {exc.code}: {detail}") from None
+        except TimeoutError:
+            raise ValueError("OpenRouter request timed out") from None
+        except urllib.error.URLError as exc:
+            raise ValueError(f"OpenRouter request failed: {exc.reason}") from None
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            raise ValueError("OpenRouter returned no JSON text") from None
+        return self._openrouter_result(body)
+
+    def _openrouter_result(self, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("OpenRouter response must be a JSON object")
+        error = payload.get("error")
+        if error:
+            message = error.get("message") if isinstance(error, dict) else error
+            raise ValueError(f"OpenRouter error: {message}")
+        choices = payload.get("choices") or []
+        usage = self._openrouter_usage(payload)
+        if not choices or not isinstance(choices[0], dict):
+            return "", [], usage
+        choice = choices[0]
+        finish = choice.get("finish_reason")
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        return self._message_text(message.get("content")), ["" if finish is None else str(finish)], usage
+
+    @staticmethod
+    def _openrouter_usage(payload):
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        details = usage.get("completion_tokens_details")
+        details = details if isinstance(details, dict) else {}
+        return {
+            "prompt_token_count": usage.get("prompt_tokens"),
+            "candidates_token_count": usage.get("completion_tokens"),
+            "thoughts_token_count": details.get("reasoning_tokens"),
+            "total_token_count": usage.get("total_tokens"),
+        }
+
+    @staticmethod
+    def _unwrap_json(text):
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            if len(lines) >= 2 and lines[-1].strip() == "```":
+                return "\n".join(lines[1:-1]).strip()
+        return stripped
+
+    @staticmethod
+    def _message_text(content):
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "".join(parts)
+
+    @staticmethod
+    def _output_truncated(finishes):
+        return any("MAX_TOKENS" in reason or reason.lower() == "length" for reason in finishes)
 
 
-PROPOSAL_SCHEMA = {"type": "object", "properties": {
-    key: {"type": "string"} for key in
-    ("hypothesis", "evidence", "change", "training_configuration", "selection_rationale", "ml_py")},
-    "required": ["hypothesis", "evidence", "change", "training_configuration", "selection_rationale", "ml_py"]}
-DECISION_SCHEMA = {"type": "object", "properties": {
-    "decision": {"type": "string", "enum": ["keep", "discard", "investigate", "failed"]},
-    **{k: {"type": "string"} for k in ("reason", "limitations", "next_experiment")}},
-    "required": ["decision", "reason", "limitations", "next_experiment"]}
+PROPOSAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "parent": {"type": "string"},
+        "hypothesis": {"type": "string"},
+        "evidence": {"type": "string"},
+        "change": {"type": "string"},
+        "edits": {"type": "array", "items": {"type": "object", "properties": {
+            "old": {"type": "string"}, "new": {"type": "string"}},
+            "required": ["old", "new"]}},
+    },
+    "required": ["parent", "hypothesis", "evidence", "change", "edits"],
+}
 
 
 def require_strings(value, keys):
@@ -224,32 +767,68 @@ def require_strings(value, keys):
             raise ValueError(f"Missing/non-empty string required: {key}")
 
 
-def propose_experiment(client, data_summary, incumbent, experiment_id):
-    task = ("Establish a valid baseline: preserve the starter model architecture and training loss; "
-            "only correct full-chain filtering/padding, seeding, shared logging and output-interface issues."
-            if incumbent is None else
-            "Propose ONE scientifically motivated model/training change based on the complete history.")
-    task += f" Experiment ID: {experiment_id}. Return the entire replacement ml.py, not a diff."
-    proposal = client.ask(build_context(task, data_summary, incumbent), PROPOSAL_SCHEMA,
-                          "proposal", experiment_id)
-    require_strings(proposal, PROPOSAL_SCHEMA["required"])
-    return proposal
+def parent_source(parent):
+    if parent == "starter":
+        return STARTER.read_text(encoding="utf-8")
+    path = SESSION_DIR / parent / "ml.py"
+    if not path.is_file():
+        raise ValueError(f"Unknown parent {parent}; use starter or an existing experiment id")
+    return path.read_text(encoding="utf-8")
 
 
-def apply_model_change(source):
-    """Validate without executing generated code; write exactly one source path."""
+def apply_edits(source, edits):
+    if not isinstance(edits, list):
+        raise ValueError("edits must be a list")
+    if len(edits) > MAX_EDITS:
+        raise ValueError(f"At most {MAX_EDITS} edits")
+    for index, edit in enumerate(edits):
+        if not isinstance(edit, dict) or not isinstance(edit.get("old"), str) or not isinstance(edit.get("new"), str):
+            raise ValueError(f"Edit {index} must have old and new strings")
+        if source.count(edit["old"]) != 1:
+            raise ValueError(f"Edit {index}: old must occur exactly once")
+        source = source.replace(edit["old"], edit["new"], 1)
+    return source
+
+
+def write_experiment_source(directory, source):
     tree = ast.parse(source, filename="ml.py")
     classes = {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
     functions = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
     if not {"Model", "Dataset"} <= classes or "main" not in functions:
         raise ValueError("ml.py must define Model, Dataset and main")
     compile(tree, "ml.py", "exec")
-    (ROOT / "ml.py").write_text(source, encoding="utf-8")
+    (directory / "ml.py").write_text(source, encoding="utf-8")
 
 
-def run_command(command, experiment_id, stage, env, timeout):
+def propose_experiment(client, data_summary, experiment_id, log_path):
+    say("  planning the next change")
+    available = ["starter", *[path.name for path in experiment_dirs()]]
+    if len(available) == 1:
+        task = ("Establish a valid baseline from the starter ml.py. Set parent to starter. "
+                "Use an empty edits list unless you must correct full-chain filtering/padding, "
+                "seeding, shared logging or output-interface issues.")
+    else:
+        task = ("Propose ONE scientifically motivated model/training change based on the complete history. "
+                "Set parent to starter or an existing experiment id. Return targeted search-replace edits, not a full file.")
+    task += f" Experiment ID: {experiment_id}. Available parents: {available}."
+    proposal = client.ask(build_context(task, data_summary), PROPOSAL_SCHEMA,
+                          "proposal", experiment_id, log_path)
+    require_strings(proposal, ["parent", "hypothesis", "evidence", "change"])
+    proposal["parent"] = proposal["parent"].strip()
+    return proposal
+
+
+def materialize_experiment(directory, proposal):
+    source = apply_edits(parent_source(proposal["parent"]), proposal.get("edits"))
+    write_experiment_source(directory, source)
+    return source
+
+
+def run_command(command, experiment_id, stage, env, timeout, log_path):
     """Fixed argv; poll for stop requests, then allow checkpoint saving before kill."""
+    say(f"  {stage}")
     start = time.monotonic()
+    announced = start
     process = subprocess.Popen(command, cwd=ROOT, env=env, start_new_session=(os.name == "posix"))
     try:
         while True:
@@ -261,10 +840,11 @@ def run_command(command, experiment_id, stage, env, timeout):
                 code = process.wait(timeout=min(1.0, remaining))
                 break
             except subprocess.TimeoutExpired:
+                if time.monotonic() - announced >= 15:
+                    say(f"  {stage} · {time.monotonic() - start:.0f}s")
+                    announced = time.monotonic()
                 continue
     except BaseException:
-        # The starter ml.py saves latest weights in finally on SIGINT. A forced
-        # SIGKILL/power failure can only retain the last successful disk save.
         try:
             if os.name == "posix":
                 os.killpg(process.pid, signal.SIGINT)
@@ -280,28 +860,29 @@ def run_command(command, experiment_id, stage, env, timeout):
             else:
                 process.kill()
             process.wait()
-        append_log("execution", experiment_id=experiment_id, stage=stage,
+        append_log(log_path, "execution", experiment_id=experiment_id, stage=stage,
                    status="interrupted_or_timeout", runtime_seconds=time.monotonic()-start)
         raise
-    append_log("execution", experiment_id=experiment_id, stage=stage,
+    append_log(log_path, "execution", experiment_id=experiment_id, stage=stage,
                returncode=code, runtime_seconds=time.monotonic()-start)
     if code:
-        raise RuntimeError(f"{stage} exited with code {code}; see console and shared log")
+        raise RuntimeError(f"{stage} exited with code {code}; see console and experiment log")
 
 
-def run_training(experiment_id, directory, args, deadline):
+def run_training(experiment_id, directory, args, deadline, log_path):
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1",
-               EXPERIMENT_DIR=str(directory), RESEARCH_LOG_PATH=str(LOG),
+               EXPERIMENT_DIR=str(directory), RESEARCH_LOG_PATH=str(log_path),
                RESEARCH_EXPERIMENT_ID=experiment_id, RESEARCH_SEED=str(args.seed))
-    directory.mkdir(parents=True, exist_ok=False)
-    # Import in a fresh process and set the existing module variable explicitly.
-    launcher = "import os, ml; ml.EXPERIMENT_DIR=os.environ['EXPERIMENT_DIR']; ml.main()"
+    launcher = ("import os, sys\n"
+                "sys.path.insert(0, os.environ['EXPERIMENT_DIR'])\n"
+                "import ml\n"
+                "ml.EXPERIMENT_DIR = os.environ['EXPERIMENT_DIR']\n"
+                "ml.main()\n")
     try:
         run_command([sys.executable, "-B", "-c", launcher], experiment_id, "training", env,
-                    max(0.01, min(args.run_timeout, deadline-time.monotonic())))
+                    max(0.01, min(args.run_timeout, deadline-time.monotonic())), log_path)
     finally:
-        # Retain checkpoints for ALL attempts, not just scientifically kept runs.
-        append_log("checkpoint_inventory", experiment_id=experiment_id,
+        append_log(log_path, "checkpoint_inventory", experiment_id=experiment_id,
                    experiment_dir=str(directory),
                    checkpoints={p.name: {"sha256": digest(p), "bytes": p.stat().st_size}
                                 for p in directory.glob("*.pth")})
@@ -309,78 +890,57 @@ def run_training(experiment_id, directory, args, deadline):
         raise RuntimeError("Training did not produce model.pth in its assigned directory")
 
 
-def run_evaluation(experiment_id, directory, proposal, args, deadline):
-    command = [sys.executable, "-B", str(ROOT / "eval.py"), "--experiment_dir", str(directory),
-               "--experiment-id", experiment_id, "--log-path", str(LOG),
-               "--hypothesis", proposal["hypothesis"], "--change", proposal["change"]]
+def run_evaluation(experiment_id, directory, proposal, args, deadline, log_path):
+    argv = ["--experiment_dir", str(directory), "--experiment-id", experiment_id,
+            "--log-path", str(log_path), "--hypothesis", proposal["hypothesis"],
+            "--change", proposal["change"]]
     if args.category_column:
-        command += ["--category-column", args.category_column]
-    run_command(command, experiment_id, "validation", dict(os.environ),
-                max(0.01, min(args.run_timeout, deadline-time.monotonic())))
-    records = [r for r in read_records() if r.get("event") == "model_evaluation"
+        argv += ["--category-column", args.category_column]
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1",
+               EXPERIMENT_DIR=str(directory), EVAL_ARGV=json.dumps(argv))
+    launcher = ("import json, os, sys\n"
+                "sys.path.insert(0, os.environ['EXPERIMENT_DIR'])\n"
+                "sys.argv = ['eval.py'] + json.loads(os.environ['EVAL_ARGV'])\n"
+                "import eval as E\n"
+                "E.main()\n")
+    run_command([sys.executable, "-B", "-c", launcher], experiment_id, "validation", env,
+                max(0.01, min(args.run_timeout, deadline-time.monotonic())), log_path)
+    records = [r for r in read_records(log_path) if r.get("event") == "model_evaluation"
                and r.get("experiment_id") == experiment_id]
     if len(records) != 1 or records[0].get("status") != "valid":
         raise RuntimeError("Expected exactly one valid fixed-evaluator report")
-    if records[0].get("split") != "validation" or records[0].get("ml_sha256") != digest(ROOT / "ml.py"):
+    if records[0].get("split") != "validation" or records[0].get("ml_sha256") != digest(directory / "ml.py"):
         raise RuntimeError("Evaluation split/source identity mismatch")
     return records[0]
 
 
-def decide_next_action(client, data_summary, incumbent, experiment_id, valid):
-    task = (f"Interpret experiment {experiment_id}. Execution_valid={valid}. "
-            "Compare full validation evidence with the incumbent and justify keep/discard/investigate/failed. "
-            "A failed execution cannot be kept. For a first valid baseline, keep it unless scientifically invalid. "
-            "Do not propose source changes in this response; provide a specific next experiment.")
-    decision = client.ask(build_context(task, data_summary, incumbent), DECISION_SCHEMA,
-                          "interpretation", experiment_id)
-    require_strings(decision, DECISION_SCHEMA["required"])
-    if decision["decision"] not in {"keep", "discard", "investigate", "failed"}:
-        raise ValueError("Unknown decision")
-    if not valid and decision["decision"] != "failed":
-        raise ValueError("Failed execution must receive a failed decision")
-    return decision
-
-
-def restore_or_keep(decision, source, previous_source, incumbent, experiment_id, directory):
-    """Promote explicitly; all other states restore the incumbent source."""
-    if decision["decision"] == "keep":
-        incumbent = {"experiment_id": experiment_id, "experiment_dir": str(directory),
-                     "ml_sha256": source_hash(source),
-                     "checkpoint_sha256": digest(directory / "model.pth")}
-        previous_source = source
-    (ROOT / "ml.py").write_text(previous_source, encoding="utf-8")
-    append_log("selection", experiment_id=experiment_id, incumbent=incumbent,
-               restored_source_sha256=source_hash(previous_source))
-    return previous_source, incumbent
-
-
-def recover_selection(resume, protocol):
-    """Recover source from the single ledger; never create revision files."""
-    records = read_records()
-    if any(r.get("event") == "research_finalized" for r in records):
-        raise ValueError("This history is frozen for final test evaluation; autonomous optimisation cannot resume")
-    sessions = [r for r in records if r.get("event") == "session_start"]
-    if sessions and not resume:
-        raise ValueError("History exists: use --resume to continue it")
-    if resume and not sessions:
-        raise ValueError("No controller session to resume")
-    if not sessions:
-        return (ROOT / "ml.py").read_text(encoding="utf-8"), None
-    last = sessions[-1]
-    if last.get("protocol") != protocol:
-        raise ValueError("Data/evaluator/objective/controller changed; cannot resume this protocol")
-    selections = [r for r in records if r.get("event") == "selection"]
-    selected = selections[-1].get("incumbent") if selections else None
-    sources = {r["experiment_id"]: r["ml_py"] for r in records
-               if r.get("event") == "proposal" and "ml_py" in r}
-    source = sources[selected["experiment_id"]] if selected else last["initial_ml_py"]
-    if selected and (source_hash(source) != selected["ml_sha256"] or
-                     not (Path(selected["experiment_dir"]) / "model.pth").is_file()):
-        raise ValueError("Selected source or checkpoint unavailable")
-    if selected and digest(Path(selected["experiment_dir"]) / "model.pth") != selected["checkpoint_sha256"]:
-        raise ValueError("Selected checkpoint hash mismatch")
-    (ROOT / "ml.py").write_text(source, encoding="utf-8")
-    return source, selected
+def open_session(args, protocol):
+    """A fresh launch creates a new trace. Resume reopens one existing trace."""
+    global SESSION_DIR
+    if args.resume or args.session:
+        if args.session:
+            directory = EXPERIMENTS / args.session
+            if not (directory / "controller.jsonl").is_file():
+                raise ValueError(f"No session {args.session}")
+        else:
+            found = session_directories()
+            if not found:
+                raise ValueError("No session to resume")
+            directory = max(found, key=lambda path: (path / "controller.jsonl").stat().st_mtime)
+        records = read_records(directory / "controller.jsonl")
+        if any(r.get("event") == "research_finalized" for r in records):
+            raise ValueError("This session is frozen for final test evaluation; autonomous optimisation cannot resume")
+        starts = [r for r in records if r.get("event") == "session_start"]
+        stored = starts[-1].get("protocol") or {} if starts else {}
+        if starts and experiment_contract(stored) != experiment_contract(protocol):
+            raise ValueError("Evaluator or dataset changed; cannot resume this session")
+        SESSION_DIR = directory
+        return directory, True
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    directory = EXPERIMENTS / f"{stamp}-{uuid.uuid4().hex[:4]}"
+    directory.mkdir(parents=True)
+    SESSION_DIR = directory
+    return directory, False
 
 
 def _run_agent_loop(args, client_factory=ArgonClient):
@@ -391,93 +951,90 @@ def _run_agent_loop(args, client_factory=ArgonClient):
     data_summary, data_paths = inspect_environment()
     protected = protected_hashes(data_paths)
     if args.dry_run:
-        print(json.dumps({"data_summary": data_summary, "model": args.model,
-                          "max_experiments": args.max_experiments,
-                          "log_path": str(LOG), "api_called": False}, indent=2))
+        say(json.dumps({"data_summary": data_summary, "provider": args.provider, "model": args.model,
+                        "max_experiments": args.max_experiments, "api_called": False}, indent=2))
         return
-    previous_source, incumbent = recover_selection(args.resume, protected)
+    session_dir, resumed = open_session(args, protected)
     deadline = time.monotonic() + args.session_timeout
-    session_id = uuid.uuid4().hex[:12]
+    session_id = session_dir.name
     SESSION_STARTED_AT = datetime.now(timezone.utc).isoformat()
-    append_log("session_start", session_id=session_id, protocol=protected,
-               initial_ml_py=previous_source, incumbent=incumbent,
-               budgets=vars(args), data_summary=data_summary)
+    ACTIVE_PATH.write_text(session_id, encoding="utf-8")
+    append_log(controller_log(), "session_start", session_id=session_id, protocol=protected,
+               resumed=resumed, budgets=vars(args), data_summary=data_summary)
+    say(f"session  {session_dir.relative_to(ROOT)}")
+    say(f"model    {args.provider} · {args.model}")
+    say(f"budget   {args.max_experiments} experiments · {'resuming' if resumed else 'new trace'}")
+    publish_session_summary(announce=True)
     client = None
-    no_promotion = 0
+    latest = None
     try:
         client = client_factory(args, deadline)
-        for index in range(args.max_experiments):
+        for _ in range(args.max_experiments):
             check_stop()
             if time.monotonic() >= deadline:
                 raise StopRequested("Session runtime budget exhausted")
-            # Reserve count+generate for BOTH proposal and interpretation.
-            if client.calls + 4 > args.max_api_calls:
-                raise StopRequested("Insufficient API budget for a complete experiment")
             assert_unchanged(protected)
-            experiment_id = f"{session_id}_{index+1:04d}"
-            directory = ROOT / "experiments" / experiment_id
-            proposal = propose_experiment(client, data_summary, incumbent, experiment_id)
-            append_log("proposal", experiment_id=experiment_id, parent=incumbent,
-                       seed=args.seed, **proposal)
-            source, valid = proposal["ml_py"], False
+            experiment_id = next_experiment_id()
+            directory = session_dir / experiment_id
+            directory.mkdir(parents=True, exist_ok=False)
+            log_path = directory / "log.jsonl"
+            say("")
+            say(f"experiment {experiment_id}")
             try:
-                apply_model_change(source)
-                run_training(experiment_id, directory, args, deadline)
+                proposal = propose_experiment(client, data_summary, experiment_id, log_path)
+                show_proposal(proposal)
+                source = materialize_experiment(directory, proposal)
+                append_log(log_path, "proposal", experiment_id=experiment_id, seed=args.seed,
+                           ml_sha256=source_hash(source), **proposal)
+                run_training(experiment_id, directory, args, deadline, log_path)
                 assert_unchanged(protected)
-                run_evaluation(experiment_id, directory, proposal, args, deadline)
+                record = run_evaluation(experiment_id, directory, proposal, args, deadline, log_path)
                 assert_unchanged(protected)
-                valid = True
+                latest = directory
+                show_result(experiment_id, record)
             except StopRequested:
                 raise
             except Exception as exc:
-                append_log("experiment_failure", experiment_id=experiment_id,
+                append_log(log_path, "experiment_failure", experiment_id=experiment_id,
                            error=f"{type(exc).__name__}: {exc}")
                 assert_unchanged(protected)
-            check_stop()
-            decision = decide_next_action(client, data_summary, incumbent, experiment_id, valid)
-            append_log("agent_decision", experiment_id=experiment_id, **decision)
-            previous_source, incumbent = restore_or_keep(
-                decision, source, previous_source, incumbent, experiment_id, directory)
-            print(f"{experiment_id}: {decision['decision']} — {decision['reason']}", flush=True)
-            no_promotion = 0 if decision["decision"] == "keep" else no_promotion + 1
-            if no_promotion >= args.patience:
-                raise StopRequested(f"Patience reached: {no_promotion} consecutive experiments without a keep decision")
-        if incumbent is None:
-            raise RuntimeError("No valid model was selected; inspect the shared log")
+                say(f"  failed  {exc}")
+                show_result(experiment_id, None)
+            finally:
+                publish_session_summary()
     except BaseException as exc:
-        (ROOT / "ml.py").write_text(previous_source, encoding="utf-8")
-        append_log("session_stopped", session_id=session_id, incumbent=incumbent,
+        append_log(controller_log(), "session_stopped", session_id=session_id,
                    error=f"{type(exc).__name__}: {exc}", api_calls_used=client.calls if client else 0)
         if isinstance(exc, StopRequested):
-            print(f"Search stopped: {exc}")
-            if incumbent:
-                print(f"Selected checkpoint: {incumbent['experiment_dir']}/model.pth")
-            else:
-                raise RuntimeError("Search stopped before selecting a valid model") from exc
+            say(f"stopped  {exc}")
+            if latest:
+                say(f"latest   {latest.relative_to(ROOT)}/model.pth")
         else:
             raise
     else:
-        append_log("session_complete", session_id=session_id, incumbent=incumbent,
+        append_log(controller_log(), "session_complete", session_id=session_id,
                    api_calls_used=client.calls)
-        print(f"Selected checkpoint: {incumbent['experiment_dir']}/model.pth")
+        if latest:
+            say(f"latest   {latest.relative_to(ROOT)}/model.pth")
     finally:
         close = getattr(client, "close", None)
         if close:
             close()
+        if ACTIVE_PATH.is_file() and ACTIVE_PATH.read_text(encoding="utf-8").strip() == session_id:
+            ACTIVE_PATH.unlink()
         SESSION_STARTED_AT = None
 
 
 def run_agent_loop(args, client_factory=ArgonClient):
     if args.dry_run:
         return _run_agent_loop(args, client_factory)
-    # Cooperating controllers share the same log lock; eval.py can still append.
     import fcntl
-    LOG.parent.mkdir(parents=True, exist_ok=True)
-    with LOG.open("a", encoding="utf-8") as lock:
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RuntimeError("Another controller holds the shared research log") from None
+            raise RuntimeError("Another controller holds the research lock") from None
         return _run_agent_loop(args, client_factory)
 
 
@@ -485,17 +1042,17 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--request-stop", action="store_true",
                         help="Append a manual stop request for the active controller; no API/data access")
-    parser.add_argument("--patience", type=int, default=3,
-                        help="Stop after this many consecutive discard/investigate/failed decisions")
-    parser.add_argument("--model", default="gemini-4-argon")
+    parser.add_argument("--provider", choices=("gemini", "openrouter"), default="gemini")
+    parser.add_argument("--model", default="gemini-4-argon",
+                        help="Gemini model id, or vendor/name when --provider openrouter")
+    parser.add_argument("--openrouter-strict", action=argparse.BooleanOptionalAction, default=False,
+                        help="Require an OpenRouter endpoint that enforces a JSON schema. Default sends JSON-object mode so smaller models can be routed")
     parser.add_argument("--max-experiments", type=int, default=2,
                         help="Total attempts this invocation, including initial baseline setup")
     parser.add_argument("--run-timeout", type=float, default=900,
                         help="Seconds per training/evaluation subprocess")
     parser.add_argument("--session-timeout", type=float, default=3600)
     parser.add_argument("--api-timeout", type=float, default=600)
-    parser.add_argument("--max-api-calls", type=int, default=8,
-                        help="Includes count_tokens; four calls per complete experiment")
     parser.add_argument("--thinking-level", choices=("low", "medium", "high"), default="high")
     parser.add_argument("--max-input-tokens", type=int, default=900000,
                         help="Full-prompt input cap, including safety margin; never silently truncated")
@@ -503,34 +1060,41 @@ def parse_args(argv=None):
                         help="Combined thinking and answer cap; synchronous maximum is 65536")
     parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--category-column")
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue the latest session, or the session named by --session")
+    parser.add_argument("--session", help="Session directory name under experiments/ to resume")
     parser.add_argument("--dry-run", action="store_true", help="Local data preflight only; no API/training")
     args = parser.parse_args(argv)
     for name in ("max_experiments", "run_timeout", "session_timeout", "api_timeout",
-                 "max_api_calls", "max_input_tokens", "max_output_tokens", "patience"):
+                 "max_input_tokens", "max_output_tokens"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.max_output_tokens > 65536:
         parser.error("Synchronous controller supports up to 65536 thinking/output tokens; longer decoding requires the background API")
     if args.max_input_tokens + args.max_output_tokens > 1048576:
         parser.error("Input and thinking/output budgets must fit the shared 1048576-token context")
+    if args.provider == "openrouter" and "/" not in args.model:
+        parser.error("Pass an OpenRouter model id like vendor/name")
     return args
 
 
 def main():
-    # Scheduler SIGTERM should use the same checkpoint/rollback path as Ctrl+C.
     def terminate(signum, frame):
         raise KeyboardInterrupt("Received SIGTERM")
     signal.signal(signal.SIGTERM, terminate)
     try:
         args = parse_args()
         if args.request_stop:
-            append_log("stop_requested", reason="Operator CLI request")
-            print("Stop requested; the active controller will stop at its next checkpoint (or after its current API request).")
+            if not ACTIVE_PATH.is_file():
+                print("No active session to stop.", file=sys.stderr)
+                return 1
+            session_dir = EXPERIMENTS / ACTIVE_PATH.read_text(encoding="utf-8").strip()
+            append_log(session_dir / "controller.jsonl", "stop_requested", reason="Operator CLI request")
+            print(f"Stop requested for {session_dir.name}; it will stop at its next checkpoint (or after its current API request).")
             return 0
         run_agent_loop(args)
     except KeyboardInterrupt:
-        print("Interrupted; incumbent ml.py restored.", file=sys.stderr)
+        print("Interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:
         print(f"Controller stopped: {type(exc).__name__}: {exc}", file=sys.stderr)
