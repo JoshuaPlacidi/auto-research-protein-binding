@@ -35,8 +35,39 @@ h1 {
 }
 
 .intro {
-  margin: 0 0 1.4rem;
+  margin: 0 0 1.1rem;
   max-width: 38rem;
+}
+
+.baselines {
+  border-collapse: collapse;
+  font-size: 0.78rem;
+  margin: 0 0 1.3rem;
+  width: auto;
+}
+
+.baselines th,
+.baselines td {
+  border-bottom: 1px solid var(--line);
+  font-weight: 400;
+  padding: 0.28rem 1.1rem 0.28rem 0;
+  text-align: left;
+}
+
+.baselines thead th {
+  color: var(--muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.visually-hidden {
+  clip-path: inset(50%);
+  height: 1px;
+  overflow: hidden;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
 }
 
 h2 {
@@ -220,45 +251,57 @@ p {
   text-decoration: underline;
 }
 
-#sessions {
-  list-style: none;
+.sessions {
+  border-collapse: collapse;
+  font-size: 0.8rem;
   margin: 0.4rem 0 0;
-  padding: 0;
-}
-
-#sessions li + li {
-  border-top: 1px solid var(--line);
-}
-
-#sessions button {
-  align-items: start;
-  background: none;
-  border: 0;
-  color: inherit;
-  cursor: pointer;
-  display: grid;
-  font: inherit;
-  gap: 0.1rem 0.85rem;
-  grid-template-columns: 0.55rem 1fr;
-  padding: 0.65rem 0;
-  text-align: left;
+  overflow-x: auto;
   width: 100%;
 }
 
-#sessions button:hover .sid {
-  color: var(--accent);
+.sessions th,
+.sessions td {
+  border-bottom: 1px solid var(--line);
+  font-weight: 400;
+  padding: 0.55rem 0.7rem 0.55rem 0;
+  text-align: left;
+  vertical-align: baseline;
 }
 
-#sessions .is-dim {
+.sessions thead th {
+  color: var(--muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sessions tbody th {
+  align-items: baseline;
+  display: flex;
+  font-weight: 400;
+  gap: 0.5rem;
+}
+
+.sessions .is-dim {
   opacity: 0.38;
+}
+
+.sessions a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.sessions a:hover {
+  color: var(--accent);
+  text-decoration: underline;
 }
 
 .swatch {
   background: currentColor;
   border-radius: 1px;
-  grid-row: span 2;
+  flex-shrink: 0;
   height: 0.55rem;
-  margin-top: 0.5rem;
+  margin-top: 0.35rem;
   width: 0.55rem;
 }
 
@@ -267,16 +310,106 @@ p {
   border: 1px solid currentColor;
 }
 
-.sid {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.session-page {
+  max-width: 52rem;
 }
 
-.stats {
+.session-page .kicker a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.session-page .kicker a:hover {
+  color: var(--accent);
+}
+
+.pager {
+  align-items: center;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+  margin: 1.6rem 0 0.8rem;
+}
+
+.pager p {
   color: var(--muted);
   font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.pager .text-btn:disabled {
+  color: var(--line);
+  cursor: default;
+  text-decoration: none;
+}
+
+#improvements {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#improvements li {
+  border-top: 1px solid var(--line);
+}
+
+#improvements button {
+  align-items: baseline;
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  gap: 1rem;
+  justify-content: space-between;
+  padding: 0.7rem 0;
+  text-align: left;
+  width: 100%;
+}
+
+#improvements button:hover {
+  color: var(--accent);
+}
+
+#improvements .score {
+  color: var(--muted);
+  flex-shrink: 0;
+  font-size: 0.78rem;
+}
+
+#improvements .expand {
+  padding: 0 0 1.4rem;
+}
+
+#improvements .expand .meta {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.diff {
+  background: var(--fill);
+  font-size: 0.75rem;
   line-height: 1.45;
+  margin: 0;
+  overflow-x: auto;
+  padding: 0.8rem;
+  white-space: pre;
+}
+
+.diff .add {
+  color: #1f6a3a;
+}
+
+.diff .del {
+  color: #9b2c2c;
+}
+
+.diff .hunk,
+.diff .file {
+  color: var(--muted);
 }
 
 #detail:not(:empty) {
@@ -295,4 +428,8 @@ p {
     padding: 2.2rem 1rem 3.5rem;
   }
 
+  #improvements button {
+    flex-direction: column;
+    gap: 0.15rem;
+  }
 }

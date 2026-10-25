@@ -1307,7 +1307,7 @@ def parse_args(argv=None):
     parser.add_argument("--request-stop", action="store_true",
                         help="Append a manual stop request for the active controller; no API/data access")
     parser.add_argument("--provider", choices=("gemini", "openrouter"), default="gemini")
-    parser.add_argument("--model", default="gemini-4-argon",
+    parser.add_argument("--model", default="gemini-3.1-pro-preview",
                         help="Gemini model id, or vendor/name when --provider openrouter")
     parser.add_argument("--max-experiments", type=int, default=2,
                         help="Total attempts this invocation, including initial baseline setup")

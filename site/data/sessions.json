@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-25T10:25:24.072372+00:00",
+  "generated_at": "2026-10-25T10:42:38.845288+00:00",
   "metric": "validation_auroc is the fixed evaluator's AUROC. Higher is better. The x-axis is experiment number within a session.",
   "sessions": [
     {
@@ -8,6 +8,8 @@
       "provider": "gemini",
       "model": "gemini-4-argon",
       "context_tokens": 974027,
+      "conclusion": "This modeling session substantially improved TCR-peptide-HLA binding prediction by replacing a basic mean-pooled embedding baseline with separate multi-kernel Conv1D sequence encoders and an interaction MLP, followed by residue-level cross-attention across split TCRalpha/TCRbeta, peptide, and HLA representations. Validation AUROC was further elevated by incorporating frozen BLOSUM62 and physicochemical amino acid features, adding dilated residual convolutions with Squeeze-and-Excitation gating, and training with label-smoothed MSE loss and exponential moving average (EMA) weight averaging. In the later stages, refining 13-term sequence interactions via a SwiGLU residual block with a skip connection, extracting mask-normalized attractive-repulsive residue affinities, and applying a depthwise-separable 2D convolution with top-8 hotspot pooling over pairwise affinity matrices drove the final performance gains. Overall, these cumulative architectural and training enhancements raised the validation AUROC to a best of 0.8230, with a corresponding AUPRC of 0.8093.",
+      "conclusion_key": "4c3df14ebafb9a3548e8fab526428ddaaed7c55992f9ab62e0a892fff3e655a1",
       "experiments": [
         {
           "id": "0001",
@@ -21,8 +23,10 @@
           "validation_auprc": 0.5025421666970131,
           "validation_loss": 0.25000169380921355,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": 46.77944422606379,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0002",
@@ -36,8 +40,11 @@
           "validation_auprc": 0.7609787128891417,
           "validation_loss": 0.18881493805067448,
           "auroc_vs_parent": 0.2971957997879837,
+          "auprc_vs_parent": 0.2584365461921285,
           "runtime_seconds": 69.01978799793869,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0001/ml.py\n+++ 0002/ml.py\n@@ -77,19 +77,61 @@\n                 torch.tensor(float(row.binding_flag), dtype=torch.float32))\n \n \n+class SeqEncoder(torch.nn.Module):\n+    def __init__(self, embed_dim, hidden_dim):\n+        super().__init__()\n+        self.convs = torch.nn.ModuleList([\n+            torch.nn.Conv1d(embed_dim, hidden_dim, kernel_size=k, padding=k // 2)\n+            for k in (3, 5, 7)\n+        ])\n+        self.out_proj = torch.nn.Sequential(\n+            torch.nn.Linear(hidden_dim * 6, hidden_dim),\n+            torch.nn.LayerNorm(hidden_dim),\n+            torch.nn.GELU()\n+        )\n+\n+    def forward(self, x, mask):\n+        # x: (B, L, D), mask: (B, L, 1) boolean\n+        x = x * mask\n+        x_t = x.transpose(1, 2)\n+        mask_t = mask.transpose(1, 2)\n+        feats = []\n+        for conv in self.convs:\n+            h = torch.nn.functional.gelu(conv(x_t)) * mask_t\n+            mean_p = h.sum(dim=2) / mask_t.sum(dim=2).clamp(min=1)\n+            h_masked = h.masked_fill(~mask_t, -1e9)\n+            max_p = h_masked.max(dim=2).values\n+            max_p = torch.where(mask_t.any(dim=2), max_p, torch.zeros_like(max_p))\n+            feats.extend([mean_p, max_p])\n+        return self.out_proj(torch.cat(feats, dim=-1))\n+\n+\n class Model(torch.nn.Module):\n-    def __init__(self, embedding_dim=768):\n+    def __init__(self, embedding_dim=64, hidden_dim=128):\n         super().__init__()\n         self.embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n-        self.fc1 = torch.nn.Linear(embedding_dim, 1)\n+        self.pep_enc = SeqEncoder(embedding_dim, hidden_dim)\n+        self.hla_enc = SeqEncoder(embedding_dim, hidden_dim)\n+        self.tcr_enc = SeqEncoder(embedding_dim, hidden_dim)\n+        self.mlp = torch.nn.Sequential(\n+            torch.nn.Linear(hidden_dim * 6, hidden_dim * 2),\n+            torch.nn.LayerNorm(hidden_dim * 2),\n+            torch.nn.GELU(),\n+            torch.nn.Dropout(0.2),\n+            torch.nn.Linear(hidden_dim * 2, hidden_dim),\n+            torch.nn.GELU(),\n+            torch.nn.Linear(hidden_dim, 1)\n+        )\n \n     def forward(self, peptide, hla, tcr):\n-        tokens = torch.cat([peptide, hla, tcr], dim=1)\n-        mask = tokens.ne(0).unsqueeze(-1)\n-        embeddings = self.embedding(tokens)\n-        pooled = (embeddings * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)\n-        return torch.sigmoid(self.fc1(pooled))\n-\n+        pep_mask = peptide.ne(0).unsqueeze(-1)\n+        hla_mask = hla.ne(0).unsqueeze(-1)\n+        tcr_mask = tcr.ne(0).unsqueeze(-1)\n+        p = self.pep_enc(self.embedding(peptide), pep_mask)\n+        h = self.hla_enc(self.embedding(hla), hla_mask)\n+        t = self.tcr_enc(self.embedding(tcr), tcr_mask)\n+        combined = torch.cat([p, h, t, p * t, h * t, p * h], dim=-1)\n+        return torch.sigmoid(self.mlp(combined))\n \n def evaluate_model(model, val_loader, device, criterion):\n     model.eval()"
         },
         {
           "id": "0003",
@@ -51,8 +58,10 @@
           "validation_auprc": 0.7528376501575276,
           "validation_loss": 0.18991668249097374,
           "auroc_vs_parent": -0.00820416583101724,
+          "auprc_vs_parent": -0.00814106273161408,
           "runtime_seconds": 101.02813422912732,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0004",
@@ -66,8 +75,11 @@
           "validation_auprc": 0.7647163082392904,
           "validation_loss": 0.18592886227105782,
           "auroc_vs_parent": 0.010215991462051766,
+          "auprc_vs_parent": 0.011878658081762805,
           "runtime_seconds": 160.40763811487705,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0003/ml.py\n+++ 0004/ml.py\n@@ -98,7 +98,7 @@\n             torch.nn.GELU()\n         )\n \n-    def forward(self, x, mask):\n+    def encode(self, x, mask):\n         # x: (B, L, D), mask: (B, L, 1) boolean\n         x = x * mask\n         x_t = x.transpose(1, 2)\n@@ -106,11 +106,12 @@\n         conv_outs = [torch.nn.functional.gelu(conv(x_t)) * mask_t for conv in self.convs]\n         h = self.proj1(torch.cat(conv_outs, dim=1).transpose(1, 2)) * mask\n         h2 = torch.nn.functional.gelu(self.conv2(h.transpose(1, 2))).transpose(1, 2)\n-        h = self.norm2(h + h2) * mask\n-\n+        return self.norm2(h + h2) * mask\n+\n+    def pool(self, h, mask):\n         scores = self.attn_queries(h).masked_fill(~mask, -1e9)\n         weights = torch.softmax(scores, dim=1) * mask\n-        attn_p = torch.einsum(\"blq,bld->bqd\", weights, h).reshape(x.size(0), -1)\n+        attn_p = torch.einsum(\"blq,bld->bqd\", weights, h).reshape(h.size(0), -1)\n \n         mean_p = h.sum(dim=1) / mask.sum(dim=1).clamp(min=1)\n         h_masked = h.masked_fill(~mask, -1e9)\n@@ -118,6 +119,19 @@\n         max_p = torch.where(mask.any(dim=1), max_p, torch.zeros_like(max_p))\n \n         return self.out_proj(torch.cat([attn_p, mean_p, max_p], dim=-1))\n+\n+\n+class CrossAttention(torch.nn.Module):\n+    def __init__(self, hidden_dim, num_heads=4, dropout=0.1):\n+        super().__init__()\n+        self.mha = torch.nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)\n+        self.norm = torch.nn.LayerNorm(hidden_dim)\n+        self.dropout = torch.nn.Dropout(dropout)\n+\n+    def forward(self, q, q_mask, kv, kv_mask):\n+        attn_out, _ = self.mha(q, kv, kv, key_padding_mask=~kv_mask.squeeze(-1), need_weights=False)\n+        return self.norm(q + self.dropout(attn_out)) * q_mask\n+\n \n class Model(torch.nn.Module):\n     def __init__(self, embedding_dim=64, hidden_dim=128):\n@@ -126,6 +140,10 @@\n         self.pep_enc = SeqEncoder(embedding_dim, hidden_dim)\n         self.hla_enc = SeqEncoder(embedding_dim, hidden_dim)\n         self.tcr_enc = SeqEncoder(embedding_dim, hidden_dim)\n+        self.pep_hla_attn = CrossAttention(hidden_dim)\n+        self.tcr_pep_attn = CrossAttention(hidden_dim)\n+        self.pep_tcr_attn = CrossAttention(hidden_dim)\n+        self.hla_tcr_attn = CrossAttention(hidden_dim)\n         self.mlp = torch.nn.Sequential(\n             torch.nn.Linear(hidden_dim * 6, hidden_dim * 2),\n             torch.nn.LayerNorm(hidden_dim * 2),\n@@ -140,9 +158,18 @@\n         pep_mask = peptide.ne(0).unsqueeze(-1)\n         hla_mask = hla.ne(0).unsqueeze(-1)\n         tcr_mask = tcr.ne(0).unsqueeze(-1)\n-        p = self.pep_enc(self.embedding(peptide), pep_mask)\n-        h = self.hla_enc(self.embedding(hla), hla_mask)\n-        t = self.tcr_enc(self.embedding(tcr), tcr_mask)\n+        p_seq = self.pep_enc.encode(self.embedding(peptide), pep_mask)\n+        h_seq = self.hla_enc.encode(self.embedding(hla), hla_mask)\n+        t_seq = self.tcr_enc.encode(self.embedding(tcr), tcr_mask)\n+\n+        p_pmhc = self.pep_hla_attn(p_seq, pep_mask, h_seq, hla_mask)\n+        t_inter = self.tcr_pep_attn(t_seq, tcr_mask, p_pmhc, pep_mask)\n+        p_inter = self.pep_tcr_attn(p_pmhc, pep_mask, t_seq, tcr_mask)\n+        h_inter = self.hla_tcr_attn(h_seq, hla_mask, t_seq, tcr_mask)\n+\n+        p = self.pep_enc.pool(p_inter, pep_mask)\n+        h = self.hla_enc.pool(h_inter, hla_mask)\n+        t = self.tcr_enc.pool(t_inter, tcr_mask)\n         combined = torch.cat([p, h, t, p * t, h * t, p * h], dim=-1)\n         return torch.sigmoid(self.mlp(combined))\n "
         },
         {
           "id": "0005",
@@ -81,8 +93,10 @@
           "validation_auprc": 0.7635605865696536,
           "validation_loss": 0.18795336494994852,
           "auroc_vs_parent": -0.0027406311778356285,
+          "auprc_vs_parent": -0.0011557216696367334,
           "runtime_seconds": 160.86431430187076,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0006",
@@ -96,8 +110,10 @@
           "validation_auprc": 0.7726766879448239,
           "validation_loss": 0.18873684943355348,
           "auroc_vs_parent": -0.003476420365011501,
+          "auprc_vs_parent": 0.007960379705533538,
           "runtime_seconds": 164.7595241558738,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0007",
@@ -111,8 +127,10 @@
           "validation_auprc": 0.760420117430438,
           "validation_loss": 0.18737242173097937,
           "auroc_vs_parent": -0.00011764748015907767,
+          "auprc_vs_parent": -0.0042961908088523515,
           "runtime_seconds": 128.85237724287435,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0008",
@@ -126,8 +144,11 @@
           "validation_auprc": 0.7663937270338854,
           "validation_loss": 0.18515630096838134,
           "auroc_vs_parent": 0.0014517018594389919,
+          "auprc_vs_parent": 0.0016774187945950425,
           "runtime_seconds": 161.5064990799874,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0004/ml.py\n+++ 0008/ml.py\n@@ -133,10 +133,63 @@\n         return self.norm(q + self.dropout(attn_out)) * q_mask\n \n \n+AA_Order = \"ACDEFGHIKLMNPQRSTVWY\"\n+BLOSUM62 = [\n+    [ 4,  0, -2, -1, -2,  0, -2, -1, -1, -1, -1, -2, -1, -1, -1,  1,  0,  0, -3, -2],\n+    [ 0,  9, -3, -4, -2, -3, -3, -1, -3, -1, -1, -3, -3, -3, -3, -1, -1, -1, -2, -2],\n+    [-2, -3,  6,  2, -3, -1, -1, -3, -1, -4, -3,  1, -1,  0, -2,  0, -1, -3, -4, -3],\n+    [-1, -4,  2,  5, -3, -2,  0, -3,  1, -3, -2,  0, -1,  2,  0,  0, -1, -2, -3, -2],\n+    [-2, -2, -3, -3,  6, -3, -1,  0, -3,  0,  0, -3, -4, -3, -3, -2, -2, -1,  1,  3],\n+    [ 0, -3, -1, -2, -3,  6, -2, -4, -2, -4, -3,  0, -2, -2, -2,  0, -2, -3, -2, -3],\n+    [-2, -3, -1,  0, -1, -2,  8, -3, -1, -3, -2,  1, -2,  0,  0, -1, -2, -3, -2,  2],\n+    [-1, -1, -3, -3,  0, -4, -3,  4, -3,  2,  1, -3, -3, -3, -3, -2, -1,  3, -3, -1],\n+    [-1, -3, -1,  1, -3, -2, -1, -3,  5, -2, -1,  0, -1,  1,  2,  0, -1, -2, -3, -2],\n+    [-1, -1, -4, -3,  0, -4, -3,  2, -2,  4,  2, -3, -3, -2, -2, -2, -1,  1, -2, -1],\n+    [-1, -1, -3, -2,  0, -3, -2,  1, -1,  2,  5, -2, -2,  0, -1, -1, -1,  1, -1, -1],\n+    [-2, -3,  1,  0, -3,  0,  1, -3,  0, -3, -2,  6, -2,  0,  0,  1,  0, -3, -4, -2],\n+    [-1, -3, -1, -1, -4, -2, -2, -3, -1, -3, -2, -2,  7, -1, -2, -1, -1, -2, -4, -3],\n+    [-1, -3,  0,  2, -3, -2,  0, -3,  1, -2,  0,  0, -1,  5,  1,  0, -1, -2, -2, -1],\n+    [-1, -3, -2,  0, -3, -2,  0, -3,  2, -2, -1,  0, -2,  1,  5, -1, -1, -3, -3, -2],\n+    [ 1, -1,  0,  0, -2,  0, -1, -2,  0, -2, -1,  1, -1,  0, -1,  4,  1, -2, -3, -2],\n+    [ 0, -1, -1, -1, -2, -2, -2, -1, -1, -1, -1,  0, -1, -1, -1,  1,  5,  0, -2, -2],\n+    [ 0, -1, -3, -2, -1, -3, -3,  3, -2,  1,  1, -3, -2, -2, -3, -2,  0,  4, -3, -1],\n+    [-3, -2, -4, -3,  1, -2, -2, -3, -3, -2, -1, -4, -4, -2, -3, -3, -2, -3, 11,  2],\n+    [-2, -2, -3, -2,  3, -3,  2, -1, -2, -1, -1, -2, -3, -1, -2, -2, -2, -1,  2,  7],\n+]\n+# Kyte-Doolittle hydropathy, net charge, normalized volume, polarity, aromaticity, H-bond donor/acceptor\n+PHYSCHEM = [\n+    [ 1.8,  0.0, 0.27, 0.0, 0.0, 0.0],\n+    [ 2.5,  0.0, 0.41, 0.0, 0.0, 0.0],\n+    [-3.5, -1.0, 0.43, 1.0, 0.0, 0.5],\n+    [-3.5, -1.0, 0.59, 1.0, 0.0, 0.5],\n+    [ 2.8,  0.0, 0.83, 0.0, 1.0, 0.0],\n+    [-0.4,  0.0, 0.10, 0.0, 0.0, 0.0],\n+    [-3.2,  0.5, 0.65, 1.0, 1.0, 1.0],\n+    [ 4.5,  0.0, 0.73, 0.0, 0.0, 0.0],\n+    [-3.9,  1.0, 0.75, 1.0, 0.0, 0.5],\n+    [ 3.8,  0.0, 0.73, 0.0, 0.0, 0.0],\n+    [ 1.9,  0.0, 0.71, 0.0, 0.0, 0.0],\n+    [-3.5,  0.0, 0.47, 1.0, 0.0, 1.0],\n+    [-1.6,  0.0, 0.44, 0.0, 0.0, 0.0],\n+    [-3.5,  0.0, 0.62, 1.0, 0.0, 1.0],\n+    [-4.5,  1.0, 0.86, 1.0, 0.0, 0.5],\n+    [-0.8,  0.0, 0.31, 1.0, 0.0, 1.0],\n+    [-0.7,  0.0, 0.48, 1.0, 0.0, 1.0],\n+    [ 4.2,  0.0, 0.58, 0.0, 0.0, 0.0],\n+    [-0.9,  0.0, 1.00, 0.0, 1.0, 0.5],\n+    [-1.3,  0.0, 0.85, 1.0, 1.0, 1.0],\n+]\n+\n+\n class Model(torch.nn.Module):\n     def __init__(self, embedding_dim=64, hidden_dim=128):\n         super().__init__()\n-        self.embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n+        self.embedding = torch.nn.Embedding(21, embedding_dim // 2, padding_idx=0)\n+        bio_rows = [[0.0] * 26]\n+        for b_row, p_row in zip(BLOSUM62, PHYSCHEM):\n+            bio_rows.append([v / 5.0 for v in b_row] + [p_row[0] / 4.5] + p_row[1:])\n+        self.register_buffer(\"bio_table\", torch.tensor(bio_rows, dtype=torch.float32))\n+        self.bio_proj = torch.nn.Linear(26, embedding_dim // 2, bias=False)\n         self.pep_enc = SeqEncoder(embedding_dim, hidden_dim)\n         self.hla_enc = SeqEncoder(embedding_dim, hidden_dim)\n         self.tcr_enc = SeqEncoder(embedding_dim, hidden_dim)\n@@ -154,14 +207,16 @@\n             torch.nn.Linear(hidden_dim, 1)\n         )\n \n+    def embed(self, tokens):\n+        return torch.cat([self.embedding(tokens), self.bio_proj(self.bio_table[tokens])], dim=-1)\n+\n     def forward(self, peptide, hla, tcr):\n         pep_mask = peptide.ne(0).unsqueeze(-1)\n         hla_mask = hla.ne(0).unsqueeze(-1)\n         tcr_mask = tcr.ne(0).unsqueeze(-1)\n-        p_seq = self.pep_enc.encode(self.embedding(peptide), pep_mask)\n-        h_seq = self.hla_enc.encode(self.embedding(hla), hla_mask)\n-        t_seq = self.tcr_enc.encode(self.embedding(tcr), tcr_mask)\n-\n+        p_seq = self.pep_enc.encode(self.embed(peptide), pep_mask)\n+        h_seq = self.hla_enc.encode(self.embed(hla), hla_mask)\n+        t_seq = self.tcr_enc.encode(self.embed(tcr), tcr_mask)\n         p_pmhc = self.pep_hla_attn(p_seq, pep_mask, h_seq, hla_mask)\n         t_inter = self.tcr_pep_attn(t_seq, tcr_mask, p_pmhc, pep_mask)\n         p_inter = self.pep_tcr_attn(p_pmhc, pep_mask, t_seq, tcr_mask)"
         },
         {
           "id": "0009",
@@ -141,8 +162,10 @@
           "validation_auprc": 0.761367955775709,
           "validation_loss": 0.18778427717006144,
           "auroc_vs_parent": -0.008318769160243877,
+          "auprc_vs_parent": -0.005025771258176381,
           "runtime_seconds": 224.973666486796,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0010",
@@ -156,8 +179,10 @@
           "validation_auprc": 0.7632821564606521,
           "validation_loss": 0.18654935508933726,
           "auroc_vs_parent": -0.006762849898289347,
+          "auprc_vs_parent": -0.003111570573233302,
           "runtime_seconds": 239.1298027439043,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0011",
@@ -171,8 +196,11 @@
           "validation_auprc": 0.7721443322013377,
           "validation_loss": 0.18446300791575712,
           "auroc_vs_parent": 0.0026720482480017127,
+          "auprc_vs_parent": 0.005750605167452294,
           "runtime_seconds": 162.7079487061128,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0008/ml.py\n+++ 0011/ml.py\n@@ -246,6 +246,8 @@\n \n def train_model(model, train_loader, val_loader, optimizer, criterion, device, epochs):\n     best_loss = float(\"inf\")\n+    ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}\n+    step = 0\n     try:\n         for epoch in range(epochs):\n             model.train()\n@@ -257,20 +259,30 @@\n                 loss = criterion(score, target)\n                 loss.backward()\n                 optimizer.step()\n+                step += 1\n+                decay = min(0.995, (1.0 + step) / (10.0 + step))\n+                with torch.no_grad():\n+                    for k, v in model.state_dict().items():\n+                        if v.is_floating_point():\n+                            ema_state[k].mul_(decay).add_(v.detach(), alpha=1.0 - decay)\n+                        else:\n+                            ema_state[k].copy_(v)\n                 loss_sum += loss.item() * len(target)\n                 count += len(target)\n+            raw_state = {k: v.detach().clone() for k, v in model.state_dict().items()}\n+            model.load_state_dict(ema_state)\n             val_loss, auroc, auprc = evaluate_model(model, val_loader, device, criterion)\n             save_checkpoint(model, \"last_model.pth\")\n             if val_loss < best_loss:\n                 best_loss = val_loss\n                 save_checkpoint(model, \"model.pth\")\n+            model.load_state_dict(raw_state)\n             log_event(\"training_epoch\", epoch=epoch+1, train_loss=loss_sum/count,\n                       validation_loss=val_loss, auroc=auroc, auprc=auprc,\n                       best_validation_loss=best_loss)\n             print(f\"Epoch {epoch+1}/{epochs}: validation loss={val_loss:.6f}, AUROC={auroc}\", flush=True)\n     finally:\n-        # Graceful SIGINT/timeout preserves the latest available weights even\n-        # if an epoch is incomplete. It is not a selected/validated checkpoint.\n+        model.load_state_dict(ema_state)\n         save_checkpoint(model, \"last_model.pth\")\n     return model\n \n@@ -297,7 +309,7 @@\n     criterion = torch.nn.MSELoss()\n     save_checkpoint(model, \"initial_model.pth\")\n     log_event(\"training_configuration\", seed=seed, epochs=epochs, learning_rate=1e-4,\n-              batch_size=128, loss=\"MSE\", train_rows=len(train_subset),\n+              ema_decay=0.995, batch_size=128, loss=\"MSE\", train_rows=len(train_subset),\n               validation_rows=len(val_subset), checkpoint_directory=str(EXPERIMENT_DIR))\n     train_model(model, train_loader, val_loader, optimizer, criterion, device, epochs)\n "
         },
         {
           "id": "0012",
@@ -186,8 +214,10 @@
           "validation_auprc": 0.7627539661023348,
           "validation_loss": 0.18658978754931335,
           "auroc_vs_parent": -0.002528973154170222,
+          "auprc_vs_parent": -0.0093903660990029,
           "runtime_seconds": 279.49071461474523,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0013",
@@ -201,8 +231,10 @@
           "validation_auprc": 0.7642343403639038,
           "validation_loss": 0.19127679317090768,
           "auroc_vs_parent": -0.006452883706271617,
+          "auprc_vs_parent": -0.007909991837433905,
           "runtime_seconds": 164.00829178420827,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0014",
@@ -216,8 +248,11 @@
           "validation_auprc": 0.7721875160173105,
           "validation_loss": 0.18303964854399343,
           "auroc_vs_parent": 0.0023013781050339466,
+          "auprc_vs_parent": 4.318381597279153e-05,
           "runtime_seconds": 162.75989534892142,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0011/ml.py\n+++ 0014/ml.py\n@@ -236,7 +236,7 @@\n         for peptide, hla, tcr, target in val_loader:\n             target = target.to(device)\n             score = model(peptide.to(device), hla.to(device), tcr.to(device)).squeeze(-1)\n-            loss_sum += criterion(score, target).item() * len(target)\n+            loss_sum += torch.nn.functional.mse_loss(score, target).item() * len(target)\n             count += len(target)\n             predictions.extend(score.cpu().tolist())\n             labels.extend(target.cpu().tolist())\n@@ -306,10 +306,10 @@\n     device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n     model = Model().to(device)\n     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)\n-    criterion = torch.nn.MSELoss()\n+    criterion = lambda score, target: torch.nn.functional.mse_loss(score, target * 0.95 + 0.025)\n     save_checkpoint(model, \"initial_model.pth\")\n     log_event(\"training_configuration\", seed=seed, epochs=epochs, learning_rate=1e-4,\n-              ema_decay=0.995, batch_size=128, loss=\"MSE\", train_rows=len(train_subset),\n+              ema_decay=0.995, label_smoothing=0.05, batch_size=128, loss=\"SmoothedMSE\", train_rows=len(train_subset),\n               validation_rows=len(val_subset), checkpoint_directory=str(EXPERIMENT_DIR))\n     train_model(model, train_loader, val_loader, optimizer, criterion, device, epochs)\n "
         },
         {
           "id": "0015",
@@ -231,8 +266,10 @@
           "validation_auprc": 0.7744441343281171,
           "validation_loss": 0.18517582035233354,
           "auroc_vs_parent": -0.0015775864538863926,
+          "auprc_vs_parent": 0.0022566183108065907,
           "runtime_seconds": 170.60965287778527,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0016",
@@ -246,8 +283,10 @@
           "validation_auprc": 0.7700837886134683,
           "validation_loss": 0.18353105632912114,
           "auroc_vs_parent": -0.004722015299544413,
+          "auprc_vs_parent": -0.002103727403842237,
           "runtime_seconds": 165.31816759100184,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0017",
@@ -261,8 +300,11 @@
           "validation_auprc": 0.7767873845356518,
           "validation_loss": 0.1827417604517567,
           "auroc_vs_parent": 0.0017885282067445774,
+          "auprc_vs_parent": 0.004599868518341266,
           "runtime_seconds": 181.15982561884448,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0014/ml.py\n+++ 0017/ml.py\n@@ -91,6 +91,14 @@\n         )\n         self.conv2 = torch.nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2)\n         self.norm2 = torch.nn.LayerNorm(hidden_dim)\n+        self.conv3 = torch.nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=4, dilation=2)\n+        self.norm3 = torch.nn.LayerNorm(hidden_dim)\n+        self.se = torch.nn.Sequential(\n+            torch.nn.Linear(hidden_dim, hidden_dim // 4),\n+            torch.nn.GELU(),\n+            torch.nn.Linear(hidden_dim // 4, hidden_dim),\n+            torch.nn.Sigmoid()\n+        )\n         self.attn_queries = torch.nn.Linear(hidden_dim, num_queries)\n         self.out_proj = torch.nn.Sequential(\n             torch.nn.Linear(hidden_dim * (num_queries + 2), hidden_dim),\n@@ -106,8 +114,11 @@\n         conv_outs = [torch.nn.functional.gelu(conv(x_t)) * mask_t for conv in self.convs]\n         h = self.proj1(torch.cat(conv_outs, dim=1).transpose(1, 2)) * mask\n         h2 = torch.nn.functional.gelu(self.conv2(h.transpose(1, 2))).transpose(1, 2)\n-        return self.norm2(h + h2) * mask\n-\n+        h = self.norm2(h + h2) * mask\n+        h3 = torch.nn.functional.gelu(self.conv3(h.transpose(1, 2))).transpose(1, 2)\n+        h = self.norm3(h + h3) * mask\n+        se_w = self.se(h.sum(dim=1) / mask.sum(dim=1).clamp(min=1)).unsqueeze(1)\n+        return h * se_w * mask\n     def pool(self, h, mask):\n         scores = self.attn_queries(h).masked_fill(~mask, -1e9)\n         weights = torch.softmax(scores, dim=1) * mask"
         },
         {
           "id": "0018",
@@ -276,8 +318,10 @@
           "validation_auprc": 0.7794678810093134,
           "validation_loss": 0.18226492585381363,
           "auroc_vs_parent": -0.0029583775033666937,
+          "auprc_vs_parent": 0.002680496473661642,
           "runtime_seconds": 216.9746992192231,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0019",
@@ -291,8 +335,10 @@
           "validation_auprc": 0.7687608152382767,
           "validation_loss": 0.1856083000946166,
           "auroc_vs_parent": -0.007173094003380842,
+          "auprc_vs_parent": -0.008026569297375108,
           "runtime_seconds": 181.71282895701006,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0020",
@@ -306,8 +352,10 @@
           "validation_auprc": 0.768929062093095,
           "validation_loss": 0.18433295259676666,
           "auroc_vs_parent": -0.006062874251497097,
+          "auprc_vs_parent": -0.007858322442556798,
           "runtime_seconds": 191.01575113786384,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0021",
@@ -321,8 +369,10 @@
           "validation_auprc": 0.7733564325719042,
           "validation_loss": 0.18222002696252007,
           "auroc_vs_parent": -0.001756296020399617,
+          "auprc_vs_parent": -0.0034309519637475416,
           "runtime_seconds": 181.26446611480787,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0022",
@@ -336,8 +386,10 @@
           "validation_auprc": 0.7719431330364089,
           "validation_loss": 0.18447648728276705,
           "auroc_vs_parent": -0.004352419562788423,
+          "auprc_vs_parent": -0.004844251499242835,
           "runtime_seconds": 197.02172655193135,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0023",
@@ -351,8 +403,10 @@
           "validation_auprc": 0.7699544792912862,
           "validation_loss": 0.186184804949918,
           "auroc_vs_parent": -0.00916934074434872,
+          "auprc_vs_parent": -0.006832905244365528,
           "runtime_seconds": 186.91252752300352,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0024",
@@ -366,8 +420,10 @@
           "validation_auprc": 0.7724906889302818,
           "validation_loss": 0.18209377118601902,
           "auroc_vs_parent": -0.0011668051456896755,
+          "auprc_vs_parent": -0.004296695605369938,
           "runtime_seconds": 241.42855809582397,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0025",
@@ -381,8 +437,10 @@
           "validation_auprc": 0.7676615511077822,
           "validation_loss": 0.18480887024732115,
           "auroc_vs_parent": -0.004766782225023913,
+          "auprc_vs_parent": -0.009125833427869545,
           "runtime_seconds": 278.93574129091576,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0026",
@@ -396,8 +454,10 @@
           "validation_auprc": 0.7656924140194676,
           "validation_loss": 0.18531224950419256,
           "auroc_vs_parent": -0.008866716328109425,
+          "auprc_vs_parent": -0.011094970516184133,
           "runtime_seconds": 181.66209375532344,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0027",
@@ -411,8 +471,10 @@
           "validation_auprc": 0.770068084092161,
           "validation_loss": 0.18429560384216667,
           "auroc_vs_parent": -0.003942712660802927,
+          "auprc_vs_parent": -0.006719300443490783,
           "runtime_seconds": 320.39544131886214,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0028",
@@ -426,8 +488,10 @@
           "validation_auprc": 0.7716597389967434,
           "validation_loss": 0.18274819316313787,
           "auroc_vs_parent": -0.0013444403059910126,
+          "auprc_vs_parent": -0.005127645538908321,
           "runtime_seconds": 180.71032689511776,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0029",
@@ -441,8 +505,10 @@
           "validation_auprc": 0.7769493213720086,
           "validation_loss": 0.1840730080928611,
           "auroc_vs_parent": -0.004821935077214179,
+          "auprc_vs_parent": 0.0001619368363567908,
           "runtime_seconds": 189.06544574769214,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0030",
@@ -456,8 +522,10 @@
           "validation_auprc": 0.7859673666605106,
           "validation_loss": 0.18350533602390479,
           "auroc_vs_parent": -0.00048025957654074247,
+          "auprc_vs_parent": 0.009179982124858821,
           "runtime_seconds": 195.01983743999153,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0031",
@@ -471,8 +539,10 @@
           "validation_auprc": 0.762459470706857,
           "validation_loss": 0.18636714712086233,
           "auroc_vs_parent": -0.008831260923129913,
+          "auprc_vs_parent": -0.014327913828794725,
           "runtime_seconds": 186.96702761016786,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0032",
@@ -486,8 +556,10 @@
           "validation_auprc": 0.786130139217435,
           "validation_loss": 0.18270427880320603,
           "auroc_vs_parent": -0.0004630690771568746,
+          "auprc_vs_parent": 0.00934275468178325,
           "runtime_seconds": 228.05804671207443,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0033",
@@ -501,8 +573,10 @@
           "validation_auprc": 0.7737547159453441,
           "validation_loss": 0.18303713470540117,
           "auroc_vs_parent": -0.001296450161877405,
+          "auprc_vs_parent": -0.0030326685903077077,
           "runtime_seconds": 188.36479062400758,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0034",
@@ -516,8 +590,10 @@
           "validation_auprc": 0.7646869234369275,
           "validation_loss": 0.18539486004465172,
           "auroc_vs_parent": -0.009395145116465775,
+          "auprc_vs_parent": -0.012100461098724313,
           "runtime_seconds": 182.56361760385334,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0035",
@@ -531,8 +607,10 @@
           "validation_auprc": 0.7722543422738131,
           "validation_loss": 0.18439641176359584,
           "auroc_vs_parent": -0.0024066699137611502,
+          "auprc_vs_parent": -0.0045330422618387045,
           "runtime_seconds": 182.11234523681924,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0036",
@@ -546,8 +624,10 @@
           "validation_auprc": 0.778355837142064,
           "validation_loss": 0.18336771442168234,
           "auroc_vs_parent": -0.0018286393719739724,
+          "auprc_vs_parent": 0.0015684526064122517,
           "runtime_seconds": 250.22894443105906,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0037",
@@ -561,8 +641,10 @@
           "validation_auprc": 0.7733773500774138,
           "validation_loss": 0.18451237084809732,
           "auroc_vs_parent": -0.0051456894822795585,
+          "auprc_vs_parent": -0.003410034458237954,
           "runtime_seconds": 200.41862403415143,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0038",
@@ -576,8 +658,10 @@
           "validation_auprc": 0.7702763153161201,
           "validation_loss": 0.18669583942547435,
           "auroc_vs_parent": -0.006898941351746513,
+          "auprc_vs_parent": -0.006511069219531707,
           "runtime_seconds": 185.96447325590998,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0039",
@@ -591,8 +675,11 @@
           "validation_auprc": 0.7850227876122016,
           "validation_loss": 0.18073034517764305,
           "auroc_vs_parent": 0.0037229965905509754,
+          "auprc_vs_parent": -0.001107351605233453,
           "runtime_seconds": 189.31426075706258,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0032/ml.py\n+++ 0039/ml.py\n@@ -209,14 +209,16 @@\n         self.tcra_enc = SeqEncoder(embedding_dim, hidden_dim)\n         self.tcrb_enc = SeqEncoder(embedding_dim, hidden_dim)\n         self.pep_hla_attn = CrossAttention(hidden_dim)\n-        self.tcra_pep_attn = CrossAttention(hidden_dim)\n-        self.tcrb_pep_attn = CrossAttention(hidden_dim)\n-        self.pep_tcra_attn = CrossAttention(hidden_dim)\n-        self.pep_tcrb_attn = CrossAttention(hidden_dim)\n-        self.hla_tcra_attn = CrossAttention(hidden_dim)\n-        self.hla_tcrb_attn = CrossAttention(hidden_dim)\n+        self.tcr_pep_attn = CrossAttention(hidden_dim)\n+        self.pep_tcr_attn = CrossAttention(hidden_dim)\n+        self.hla_tcr_attn = CrossAttention(hidden_dim)\n+        self.tcr_fuse = torch.nn.Sequential(\n+            torch.nn.Linear(hidden_dim * 3, hidden_dim),\n+            torch.nn.LayerNorm(hidden_dim),\n+            torch.nn.GELU()\n+        )\n         self.mlp = torch.nn.Sequential(\n-            torch.nn.Linear(hidden_dim * 10, hidden_dim * 2),\n+            torch.nn.Linear(hidden_dim * 6, hidden_dim * 2),\n             torch.nn.LayerNorm(hidden_dim * 2),\n             torch.nn.GELU(),\n             torch.nn.Dropout(0.2),\n@@ -230,11 +232,13 @@\n \n     def split_tcr(self, tcr):\n         tcra = tcr.clamp(min=0)\n+        max_a = max(1, int(tcra.ne(0).sum(dim=1).max().item()))\n+        tcra = tcra[:, :max_a]\n         beta_mask = tcr.lt(0)\n         if not beta_mask.any():\n             return tcra, tcra\n         lengths = beta_mask.sum(dim=1)\n-        max_len = int(lengths.max().item())\n+        max_len = max(1, int(lengths.max().item()))\n         bsz = tcr.size(0)\n         idx = torch.arange(max_len, device=tcr.device).unsqueeze(0).expand(bsz, max_len)\n         starts = beta_mask.int().argmax(dim=1, keepdim=True)\n@@ -252,17 +256,21 @@\n         h_seq = self.hla_enc.encode(self.embed(hla), hla_mask)\n         ta_seq = self.tcra_enc.encode(self.embed(tcra), tcra_mask)\n         tb_seq = self.tcrb_enc.encode(self.embed(tcrb), tcrb_mask)\n+        t_seq = torch.cat([ta_seq, tb_seq], dim=1)\n+        tcr_mask = torch.cat([tcra_mask, tcrb_mask], dim=1)\n+\n         p_pmhc = self.pep_hla_attn(p_seq, pep_mask, h_seq, hla_mask)\n-        ta_inter = self.tcra_pep_attn(ta_seq, tcra_mask, p_pmhc, pep_mask)\n-        tb_inter = self.tcrb_pep_attn(tb_seq, tcrb_mask, p_pmhc, pep_mask)\n-        p_inter = self.pep_tcrb_attn(self.pep_tcra_attn(p_pmhc, pep_mask, ta_seq, tcra_mask), pep_mask, tb_seq, tcrb_mask)\n-        h_inter = self.hla_tcrb_attn(self.hla_tcra_attn(h_seq, hla_mask, ta_seq, tcra_mask), hla_mask, tb_seq, tcrb_mask)\n-\n+        t_inter = self.tcr_pep_attn(t_seq, tcr_mask, p_pmhc, pep_mask)\n+        p_inter = self.pep_tcr_attn(p_pmhc, pep_mask, t_seq, tcr_mask)\n+        h_inter = self.hla_tcr_attn(h_seq, hla_mask, t_seq, tcr_mask)\n+\n+        ta_inter, tb_inter = t_inter[:, :tcra.size(1)], t_inter[:, tcra.size(1):]\n         p = self.pep_enc.pool(p_inter, pep_mask)\n         h = self.hla_enc.pool(h_inter, hla_mask)\n         ta = self.tcra_enc.pool(ta_inter, tcra_mask)\n         tb = self.tcrb_enc.pool(tb_inter, tcrb_mask)\n-        combined = torch.cat([p, h, ta, tb, p * ta, p * tb, h * ta, h * tb, ta * tb, p * h], dim=-1)\n+        t = self.tcr_fuse(torch.cat([ta, tb, ta * tb], dim=-1))\n+        combined = torch.cat([p, h, t, p * t, h * t, p * h], dim=-1)\n         return torch.sigmoid(self.mlp(combined))\n def evaluate_model(model, val_loader, device, criterion):\n     model.eval()"
         },
         {
           "id": "0040",
@@ -606,8 +693,10 @@
           "validation_auprc": 0.776107640611782,
           "validation_loss": 0.18166704613742107,
           "auroc_vs_parent": -0.00036440277340077376,
+          "auprc_vs_parent": -0.0006797439238698244,
           "runtime_seconds": 184.91557993832976,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0041",
@@ -621,8 +710,10 @@
           "validation_auprc": 0.7722717108534279,
           "validation_loss": 0.18241090798241763,
           "auroc_vs_parent": -0.006970210297109203,
+          "auprc_vs_parent": -0.012751076758773627,
           "runtime_seconds": 208.620303935837,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0042",
@@ -636,8 +727,10 @@
           "validation_auprc": 0.7833826948558418,
           "validation_loss": 0.1817935102858617,
           "auroc_vs_parent": 0.0020787969515514426,
+          "auprc_vs_parent": 0.007275054244059831,
           "runtime_seconds": 185.07731194607913,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0043",
@@ -651,8 +744,10 @@
           "validation_auprc": 0.7868416975067811,
           "validation_loss": 0.18062272325038362,
           "auroc_vs_parent": -0.00016886084290745895,
+          "auprc_vs_parent": 0.0018189098945795568,
           "runtime_seconds": 249.48067658999935,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0044",
@@ -666,8 +761,10 @@
           "validation_auprc": 0.7718186790719143,
           "validation_loss": 0.18133459722258466,
           "auroc_vs_parent": -0.006093494828524615,
+          "auprc_vs_parent": -0.013204108540287307,
           "runtime_seconds": 203.52133661834523,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0045",
@@ -681,8 +778,10 @@
           "validation_auprc": 0.7844616692863974,
           "validation_loss": 0.18198931678105856,
           "auroc_vs_parent": -0.0022906340429189598,
+          "auprc_vs_parent": -0.0005611183258041885,
           "runtime_seconds": 189.51656006695703,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0046",
@@ -696,8 +795,10 @@
           "validation_auprc": 0.7727485297607547,
           "validation_loss": 0.18036216460781943,
           "auroc_vs_parent": -0.000603279087757369,
+          "auprc_vs_parent": -0.012274257851446868,
           "runtime_seconds": 189.26661206502467,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0047",
@@ -711,8 +812,10 @@
           "validation_auprc": 0.7743898202710426,
           "validation_loss": 0.18400537706972847,
           "auroc_vs_parent": -0.007964931381256646,
+          "auprc_vs_parent": 0.0016412905102879405,
           "runtime_seconds": 204.71955636935309,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0048",
@@ -726,8 +829,10 @@
           "validation_auprc": 0.7847119992363801,
           "validation_loss": 0.18082302823399365,
           "auroc_vs_parent": -0.0009447611953127266,
+          "auprc_vs_parent": 0.011963469475625432,
           "runtime_seconds": 189.04656447516754,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0049",
@@ -741,8 +846,11 @@
           "validation_auprc": 0.7920464087474086,
           "validation_loss": 0.1801886430798769,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": 224.72515970980749,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": null
         },
         {
           "id": "0050",
@@ -756,8 +864,10 @@
           "validation_auprc": 0.792622403086848,
           "validation_loss": 0.17952836693132096,
           "auroc_vs_parent": -0.0006202905194394592,
+          "auprc_vs_parent": 0.0005759943394393341,
           "runtime_seconds": 236.7778187058866,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0051",
@@ -771,8 +881,10 @@
           "validation_auprc": 0.7802153370217146,
           "validation_loss": 0.18082438358426833,
           "auroc_vs_parent": -0.005976205483769204,
+          "auprc_vs_parent": -0.011831071725693976,
           "runtime_seconds": 223.97822982957587,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0052",
@@ -786,8 +898,10 @@
           "validation_auprc": 0.7875410515698189,
           "validation_loss": 0.18074226143817088,
           "auroc_vs_parent": -0.004173530928573532,
+          "auprc_vs_parent": -0.004505357177589708,
           "runtime_seconds": 243.37882804172114,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0053",
@@ -801,8 +915,10 @@
           "validation_auprc": 0.7880908667581576,
           "validation_loss": 0.18066047353131323,
           "auroc_vs_parent": -0.002093301435406647,
+          "auprc_vs_parent": -0.003955541989250966,
           "runtime_seconds": 238.32667758176103,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0054",
@@ -816,8 +932,10 @@
           "validation_auprc": 0.7853747506928304,
           "validation_loss": 0.18158828851346936,
           "auroc_vs_parent": -0.004119989685700487,
+          "auprc_vs_parent": -0.0066716580545782556,
           "runtime_seconds": 224.777418050915,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0055",
@@ -831,8 +949,10 @@
           "validation_auprc": 0.7861811925166011,
           "validation_loss": 0.18110938859644468,
           "auroc_vs_parent": -0.004708048018794986,
+          "auprc_vs_parent": -0.005865216230807491,
           "runtime_seconds": 235.87673203879967,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0056",
@@ -846,8 +966,11 @@
           "validation_auprc": 0.7898012946386024,
           "validation_loss": 0.17888511690769318,
           "auroc_vs_parent": 0.004841453456722933,
+          "auprc_vs_parent": -0.0022451141088062343,
           "runtime_seconds": 226.3777833012864,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0049/ml.py\n+++ 0056/ml.py\n@@ -219,7 +219,16 @@\n             torch.nn.LayerNorm(hidden_dim),\n             torch.nn.GELU()\n         )\n+        self.inter_norm = torch.nn.LayerNorm(hidden_dim * 13)\n+        self.inter_block = torch.nn.Sequential(\n+            torch.nn.Linear(hidden_dim * 13, hidden_dim * 4),\n+            torch.nn.GELU(),\n+            torch.nn.Dropout(0.2),\n+            torch.nn.Linear(hidden_dim * 4, hidden_dim * 13),\n+            torch.nn.Dropout(0.2)\n+        )\n         self.mlp = torch.nn.Sequential(\n+            torch.nn.LayerNorm(hidden_dim * 13),\n             torch.nn.Linear(hidden_dim * 13, hidden_dim * 2),\n             torch.nn.LayerNorm(hidden_dim * 2),\n             torch.nn.GELU(),\n@@ -274,11 +283,12 @@\n         ta = self.tcra_enc.pool(ta_inter, tcra_mask)\n         tb = self.tcrb_enc.pool(tb_inter, tcrb_mask)\n         t = self.tcr_fuse(torch.cat([ta, tb, ta * tb], dim=-1))\n-        combined = torch.cat([\n+        combined = self.inter_norm(torch.cat([\n             p, h, t, ta, tb,\n             p * t, h * t, p * h,\n             p * ta, p * tb, h * ta, h * tb, ta * tb,\n-        ], dim=-1)\n+        ], dim=-1))\n+        combined = combined + self.inter_block(combined)\n         return torch.sigmoid(self.mlp(combined))\n def evaluate_model(model, val_loader, device, criterion):\n     model.eval()"
         },
         {
           "id": "0057",
@@ -861,8 +984,11 @@
           "validation_auprc": 0.7982890769981672,
           "validation_loss": 0.17808278235710384,
           "auroc_vs_parent": 0.00022276022118439265,
+          "auprc_vs_parent": 0.008487782359564822,
           "runtime_seconds": 226.7730918088928,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0056/ml.py\n+++ 0057/ml.py\n@@ -220,23 +220,25 @@\n             torch.nn.GELU()\n         )\n         self.inter_norm = torch.nn.LayerNorm(hidden_dim * 13)\n-        self.inter_block = torch.nn.Sequential(\n-            torch.nn.Linear(hidden_dim * 13, hidden_dim * 4),\n-            torch.nn.GELU(),\n+        self.inter_gate = torch.nn.Linear(hidden_dim * 13, hidden_dim * 4)\n+        self.inter_up = torch.nn.Linear(hidden_dim * 13, hidden_dim * 4)\n+        self.inter_down = torch.nn.Sequential(\n             torch.nn.Dropout(0.2),\n             torch.nn.Linear(hidden_dim * 4, hidden_dim * 13),\n             torch.nn.Dropout(0.2)\n         )\n-        self.mlp = torch.nn.Sequential(\n-            torch.nn.LayerNorm(hidden_dim * 13),\n+        self.head_norm = torch.nn.LayerNorm(hidden_dim * 13)\n+        self.skip_proj = torch.nn.Linear(hidden_dim * 13, hidden_dim)\n+        self.mlp_body = torch.nn.Sequential(\n             torch.nn.Linear(hidden_dim * 13, hidden_dim * 2),\n             torch.nn.LayerNorm(hidden_dim * 2),\n             torch.nn.GELU(),\n             torch.nn.Dropout(0.2),\n             torch.nn.Linear(hidden_dim * 2, hidden_dim),\n-            torch.nn.GELU(),\n-            torch.nn.Linear(hidden_dim, 1)\n-        )\n+            torch.nn.LayerNorm(hidden_dim),\n+            torch.nn.GELU()\n+        )\n+        self.out_head = torch.nn.Linear(hidden_dim, 1)\n \n     def embed(self, tokens):\n         return torch.cat([self.embedding(tokens), self.bio_proj(self.bio_table[tokens])], dim=-1)\n@@ -288,8 +290,10 @@\n             p * t, h * t, p * h,\n             p * ta, p * tb, h * ta, h * tb, ta * tb,\n         ], dim=-1))\n-        combined = combined + self.inter_block(combined)\n-        return torch.sigmoid(self.mlp(combined))\n+        gated = torch.nn.functional.silu(self.inter_gate(combined)) * self.inter_up(combined)\n+        combined = self.head_norm(combined + self.inter_down(gated))\n+        h_out = self.mlp_body(combined) + self.skip_proj(combined)\n+        return torch.sigmoid(self.out_head(h_out))\n def evaluate_model(model, val_loader, device, criterion):\n     model.eval()\n     predictions, labels = [], []"
         },
         {
           "id": "0058",
@@ -876,8 +1002,10 @@
           "validation_auprc": 0.7950939276094076,
           "validation_loss": 0.18127565786555136,
           "auroc_vs_parent": -0.00728930894192481,
+          "auprc_vs_parent": -0.003195149388759644,
           "runtime_seconds": 227.6261173072271,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0059",
@@ -891,8 +1019,10 @@
           "validation_auprc": 0.7873271782997913,
           "validation_loss": 0.17943874907516413,
           "auroc_vs_parent": -0.008036021258917558,
+          "auprc_vs_parent": -0.010961898698375938,
           "runtime_seconds": 227.87563423905522,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0060",
@@ -906,8 +1036,10 @@
           "validation_auprc": 0.7884300288613988,
           "validation_loss": 0.1805167512542388,
           "auroc_vs_parent": -0.0029968770592786464,
+          "auprc_vs_parent": 0.0011028505616075268,
           "runtime_seconds": 228.32483485387638,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0061",
@@ -921,8 +1053,10 @@
           "validation_auprc": 0.7910862018375137,
           "validation_loss": 0.18018672578030143,
           "auroc_vs_parent": -0.0076451164656333725,
+          "auprc_vs_parent": -0.0072028751606535435,
           "runtime_seconds": 226.72648432618007,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0062",
@@ -936,8 +1070,10 @@
           "validation_auprc": 0.794503808642977,
           "validation_loss": 0.1788216829422586,
           "auroc_vs_parent": 0.006330043262756768,
+          "auprc_vs_parent": 0.007176630343185719,
           "runtime_seconds": 227.62290672631934,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0063",
@@ -951,8 +1087,10 @@
           "validation_auprc": 0.7893533056725184,
           "validation_loss": 0.17903803246879954,
           "auroc_vs_parent": 0.003365040254419416,
+          "auprc_vs_parent": 0.0020261273727271156,
           "runtime_seconds": 239.02474065497518,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0064",
@@ -966,8 +1104,10 @@
           "validation_auprc": 0.7931656710172439,
           "validation_loss": 0.17681459110343936,
           "auroc_vs_parent": -0.003305768845084933,
+          "auprc_vs_parent": -0.005123405980923312,
           "runtime_seconds": 345.49819811666384,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0065",
@@ -981,8 +1121,10 @@
           "validation_auprc": 0.7948794796991114,
           "validation_loss": 0.18033944173239744,
           "auroc_vs_parent": -0.0019726098043147955,
+          "auprc_vs_parent": 0.0017138086818675458,
           "runtime_seconds": 348.2537753563374,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0066",
@@ -996,8 +1138,10 @@
           "validation_auprc": 0.7933103679965168,
           "validation_loss": 0.17853415226956193,
           "auroc_vs_parent": -0.0003923373348995174,
+          "auprc_vs_parent": 0.00014469697927288472,
           "runtime_seconds": 447.77994897495955,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0067",
@@ -1011,8 +1155,10 @@
           "validation_auprc": 0.7924033856929065,
           "validation_loss": 0.17609718752523976,
           "auroc_vs_parent": 0.0004956593989055014,
+          "auprc_vs_parent": -0.0007622853243374195,
           "runtime_seconds": 412.071355571039,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0068",
@@ -1026,8 +1172,10 @@
           "validation_auprc": 0.7928383248517987,
           "validation_loss": 0.17891551878033043,
           "auroc_vs_parent": -0.004872074033750673,
+          "auprc_vs_parent": 0.00043493915889225576,
           "runtime_seconds": 413.5700365798548,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0069",
@@ -1041,8 +1189,10 @@
           "validation_auprc": 0.799502124427832,
           "validation_loss": 0.17725878765193678,
           "auroc_vs_parent": 0.0015571727358680842,
+          "auprc_vs_parent": 0.007098738734925503,
           "runtime_seconds": 412.47352626919746,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0070",
@@ -1056,8 +1206,10 @@
           "validation_auprc": 0.8009679094268146,
           "validation_loss": 0.17756016081531026,
           "auroc_vs_parent": -0.001911547717961315,
+          "auprc_vs_parent": 0.0014657849989826444,
           "runtime_seconds": 413.1406550221145,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0071",
@@ -1071,8 +1223,11 @@
           "validation_auprc": 0.7923614668088619,
           "validation_loss": 0.17706896566587121,
           "auroc_vs_parent": 0.0013197289631262654,
+          "auprc_vs_parent": -0.007140657618970092,
           "runtime_seconds": 475.58802416501567,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0069/ml.py\n+++ 0071/ml.py\n@@ -165,16 +165,28 @@\n         mask_b = b_mask.squeeze(-1).unsqueeze(1).unsqueeze(2)\n         pair_mask = mask_a & mask_b\n         sim_zero = sim.masked_fill(~pair_mask, 0.0)\n-        sim_patch = 0.5 * (sim_zero + torch.nn.functional.avg_pool2d(sim_zero, kernel_size=3, stride=1, padding=1) * pair_mask)\n+        mask_f = pair_mask.to(sim.dtype)\n+        patch_sum = torch.nn.functional.avg_pool2d(sim_zero, kernel_size=3, stride=1, padding=1)\n+        patch_cnt = torch.nn.functional.avg_pool2d(mask_f, kernel_size=3, stride=1, padding=1).clamp(min=1e-6)\n+        sim_patch = 0.5 * (sim_zero + (patch_sum / patch_cnt) * mask_f)\n+        len_a = mask_a.squeeze(-1).sum(dim=-1).clamp(min=1)\n+        len_b = mask_b.squeeze(-2).sum(dim=-1).clamp(min=1)\n         sim_neg = sim_patch.masked_fill(~pair_mask, -1e9)\n         max_b = sim_neg.max(dim=-1).values.masked_fill(~mask_a.squeeze(-1), 0.0)\n-        mean_a_max_b = max_b.sum(dim=-1) / mask_a.squeeze(-1).sum(dim=-1).clamp(min=1)\n+        mean_a_max_b = max_b.sum(dim=-1) / len_a\n         max_a = sim_neg.max(dim=-2).values.masked_fill(~mask_b.squeeze(-2), 0.0)\n-        mean_b_max_a = max_a.sum(dim=-1) / mask_b.squeeze(-2).sum(dim=-1).clamp(min=1)\n+        mean_b_max_a = max_a.sum(dim=-1) / len_b\n         global_max = max_b.masked_fill(~mask_a.squeeze(-1), -1e9).max(dim=-1).values\n         global_max = torch.where(mask_a.squeeze(-1).any(dim=-1), global_max, torch.zeros_like(global_max))\n+        sim_pos = sim_patch.masked_fill(~pair_mask, 1e9)\n+        min_b = sim_pos.min(dim=-1).values.masked_fill(~mask_a.squeeze(-1), 0.0)\n+        mean_a_min_b = min_b.sum(dim=-1) / len_a\n+        min_a = sim_pos.min(dim=-2).values.masked_fill(~mask_b.squeeze(-2), 0.0)\n+        mean_b_min_a = min_a.sum(dim=-1) / len_b\n+        global_min = min_b.masked_fill(~mask_a.squeeze(-1), 1e9).min(dim=-1).values\n+        global_min = torch.where(mask_a.squeeze(-1).any(dim=-1), global_min, torch.zeros_like(global_min))\n         global_mean = sim_patch.sum(dim=(-2, -1)) / pair_mask.sum(dim=(-2, -1)).clamp(min=1)\n-        return torch.cat([mean_a_max_b, mean_b_max_a, global_max, global_mean], dim=-1)\n+        return torch.cat([mean_a_max_b, mean_b_max_a, mean_a_min_b, mean_b_min_a, global_max, global_min, global_mean], dim=-1)\n AA_Order = \"ACDEFGHIKLMNPQRSTVWY\"\n BLOSUM62 = [\n     [ 4,  0, -2, -1, -2,  0, -2, -1, -1, -1, -1, -2, -1, -1, -1,  1,  0,  0, -3, -2],\n@@ -249,8 +261,8 @@\n         )\n         self.pair_tcr_pep = PairwiseAffinity(hidden_dim, num_heads=8)\n         self.pair_mhc = PairwiseAffinity(hidden_dim, num_heads=8)\n-        self.pair_norm = torch.nn.LayerNorm(160)\n-        in_dim = hidden_dim * 13 + 160\n+        self.pair_norm = torch.nn.LayerNorm(280)\n+        in_dim = hidden_dim * 13 + 280\n         self.inter_norm = torch.nn.LayerNorm(hidden_dim * 13)\n         self.inter_gate = torch.nn.Linear(in_dim, hidden_dim * 4)\n         self.inter_up = torch.nn.Linear(in_dim, hidden_dim * 4)"
         },
         {
           "id": "0072",
@@ -1086,8 +1241,10 @@
           "validation_auprc": 0.8034286562220018,
           "validation_loss": 0.17685125769159793,
           "auroc_vs_parent": 0.0010199696301177452,
+          "auprc_vs_parent": 0.003926531794169796,
           "runtime_seconds": 440.42829643236473,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0073",
@@ -1101,8 +1258,10 @@
           "validation_auprc": 0.7992323381098407,
           "validation_loss": 0.177094668592388,
           "auroc_vs_parent": -0.0009845142251383443,
+          "auprc_vs_parent": -0.00026978631799123853,
           "runtime_seconds": 441.38020345009863,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0074",
@@ -1116,8 +1275,10 @@
           "validation_auprc": 0.7939340665736241,
           "validation_loss": 0.17595467762450714,
           "auroc_vs_parent": -0.0009700097412831399,
+          "auprc_vs_parent": -0.005568057854207886,
           "runtime_seconds": 440.43028010893613,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0075",
@@ -1131,8 +1292,10 @@
           "validation_auprc": 0.798726019305817,
           "validation_loss": 0.17557356967674975,
           "auroc_vs_parent": 0.0013517820817695592,
+          "auprc_vs_parent": 0.004791952732192906,
           "runtime_seconds": 485.34685079567134,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0076",
@@ -1146,8 +1309,10 @@
           "validation_auprc": 0.7998217380767562,
           "validation_loss": 0.17509564244796885,
           "auroc_vs_parent": -0.00035276337277612146,
+          "auprc_vs_parent": 0.00031961364892418853,
           "runtime_seconds": 416.9709292380139,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0077",
@@ -1161,8 +1326,10 @@
           "validation_auprc": 0.7923727737343852,
           "validation_loss": 0.17760950563628533,
           "auroc_vs_parent": -0.004190184224851734,
+          "auprc_vs_parent": -0.007448964342370967,
           "runtime_seconds": 415.07584847696126,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0078",
@@ -1176,8 +1343,11 @@
           "validation_auprc": 0.8093487773973733,
           "validation_loss": 0.17439504236666786,
           "auroc_vs_parent": 0.003533722029624875,
+          "auprc_vs_parent": 0.009527039320617159,
           "runtime_seconds": 488.74308662861586,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0076/ml.py\n+++ 0078/ml.py\n@@ -154,6 +154,13 @@\n         self.scale = self.head_dim ** -0.5\n         self.q_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)\n         self.k_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)\n+        self.conv2d = torch.nn.Sequential(\n+            torch.nn.Conv2d(num_heads, num_heads, kernel_size=3, padding=1, groups=num_heads, bias=False),\n+            torch.nn.GroupNorm(1, num_heads),\n+            torch.nn.GELU(),\n+            torch.nn.Conv2d(num_heads, num_heads, kernel_size=1, bias=False),\n+            torch.nn.Dropout(0.1)\n+        )\n \n     def forward(self, a, a_mask, b, b_mask):\n         bsz, la, _ = a.shape\n@@ -165,7 +172,7 @@\n         mask_b = b_mask.squeeze(-1).unsqueeze(1).unsqueeze(2)\n         pair_mask = mask_a & mask_b\n         sim_zero = sim.masked_fill(~pair_mask, 0.0)\n-        sim_patch = 0.5 * (sim_zero + torch.nn.functional.avg_pool2d(sim_zero, kernel_size=3, stride=1, padding=1) * pair_mask)\n+        sim_patch = 0.5 * (sim_zero + self.conv2d(sim_zero)) * pair_mask\n         sim_neg = sim_patch.masked_fill(~pair_mask, -1e9)\n         max_b_neg = sim_neg.max(dim=-1).values.masked_fill(~mask_a.squeeze(-1), -1e9)\n         max_b = max_b_neg.masked_fill(~mask_a.squeeze(-1), 0.0)"
         },
         {
           "id": "0079",
@@ -1191,8 +1361,10 @@
           "validation_auprc": 0.7936144576251434,
           "validation_loss": 0.17904991033515455,
           "auroc_vs_parent": -0.003645818411024737,
+          "auprc_vs_parent": -0.006207280451612784,
           "runtime_seconds": 443.37867542682216,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0080",
@@ -1206,8 +1378,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0081",
@@ -1221,8 +1395,10 @@
           "validation_auprc": 0.7956611249251433,
           "validation_loss": 0.17706029589041286,
           "auroc_vs_parent": -0.005289301779216493,
+          "auprc_vs_parent": -0.013687652472230027,
           "runtime_seconds": 467.0672514322214,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0082",
@@ -1236,8 +1412,10 @@
           "validation_auprc": 0.7983638143027696,
           "validation_loss": 0.1778013611283644,
           "auroc_vs_parent": -0.0004881385554248441,
+          "auprc_vs_parent": -0.0014579237739865691,
           "runtime_seconds": 416.7499077809043,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0083",
@@ -1251,8 +1429,10 @@
           "validation_auprc": 0.793912659879163,
           "validation_loss": 0.17867683748055388,
           "auroc_vs_parent": -0.006579305503824573,
+          "auprc_vs_parent": -0.01543611751821028,
           "runtime_seconds": 526.8856356181204,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0084",
@@ -1266,8 +1446,10 @@
           "validation_auprc": 0.7920109891090793,
           "validation_loss": 0.179173081025272,
           "auroc_vs_parent": -0.007092871672922052,
+          "auprc_vs_parent": -0.0078107489676768616,
           "runtime_seconds": 498.27124601090327,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0085",
@@ -1281,8 +1463,10 @@
           "validation_auprc": 0.7960632533203097,
           "validation_loss": 0.1775926928947971,
           "auroc_vs_parent": -0.007901899550181835,
+          "auprc_vs_parent": -0.013285524077063626,
           "runtime_seconds": 554.5916177537292,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0086",
@@ -1296,8 +1480,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": 53.06303834915161,
-          "error": null
+          "error": null,
+          "improved": false
         }
       ]
     },
@@ -1307,6 +1493,8 @@
       "provider": "openrouter",
       "model": "recursive/flint-v1.0:free",
       "context_tokens": 181261,
+      "conclusion": "This autonomous modeling session established a baseline using binary cross-entropy loss and then substantially improved validation AUROC by replacing masked mean pooling with masked max pooling over the convolutional activations. Subsequent gains were achieved by introducing separate amino-acid embeddings for the peptide, HLA, and TCR chains, and progressively deepening the encoder to three masked convolutional blocks with ReLU activations. Finally, calibrating the pre-sigmoid logits with both learnable and fixed temperature scaling\u2014specifically refining the fixed temperature to 1.75\u2014yielded further improvements. Across the session, the model achieved a best validation AUROC of 0.7777 and a peak AUPRC of 0.7426.",
+      "conclusion_key": "14433bd13a4364ebc8b8a7844f13c8f04a04e2326512067a66e5984b230c07f4",
       "experiments": [
         {
           "id": "0001",
@@ -1320,8 +1508,10 @@
           "validation_auprc": 0.5025425370163101,
           "validation_loss": 0.2500016938505682,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": 46.9790418590419,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0002",
@@ -1335,8 +1525,11 @@
           "validation_auprc": 0.5025445522093521,
           "validation_loss": 0.2500017545383156,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": 46.679249606095254,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- starter/ml.py\n+++ 0002/ml.py\n@@ -157,7 +157,7 @@\n     device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n     model = Model().to(device)\n     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)\n-    criterion = torch.nn.MSELoss()\n+    criterion = torch.nn.BCELoss()\n     save_checkpoint(model, \"initial_model.pth\")\n     log_event(\"training_configuration\", seed=seed, epochs=epochs, learning_rate=1e-4,\n               batch_size=128, loss=\"MSE\", train_rows=len(train_subset),"
         },
         {
           "id": "0003",
@@ -1350,8 +1543,10 @@
           "validation_auprc": 0.5018350532248312,
           "validation_loss": 0.24999392440704873,
           "auroc_vs_parent": -0.00036834226284265803,
+          "auprc_vs_parent": -0.0007094989845208843,
           "runtime_seconds": 84.23743870621547,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0004",
@@ -1365,8 +1560,11 @@
           "validation_auprc": 0.6896972440673761,
           "validation_loss": 0.21698016500965264,
           "auroc_vs_parent": 0.21468981892673977,
+          "auprc_vs_parent": 0.18786219084254485,
           "runtime_seconds": 85.74178382521495,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0003/ml.py\n+++ 0004/ml.py\n@@ -91,7 +91,7 @@\n         conv = self.conv1(embeddings.transpose(1, 2))\n         conv = torch.relu(conv)\n         mask_float = mask.to(conv.dtype).transpose(1, 2)\n-        pooled = (conv * mask_float).sum(dim=2) / mask_float.sum(dim=2).clamp(min=1)\n+        pooled = conv.masked_fill(~mask_float.bool(), float(\"-inf\")).max(dim=2).values\n         return torch.sigmoid(self.fc1(pooled))\n \n "
         },
         {
           "id": "0005",
@@ -1380,8 +1578,10 @@
           "validation_auprc": 0.49790552110883224,
           "validation_loss": 0.5002985311470826,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": 83.63728167908266,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0006",
@@ -1395,8 +1595,11 @@
           "validation_auprc": 0.7239225737129469,
           "validation_loss": 0.19993158286890592,
           "auroc_vs_parent": 0.041260242672549574,
+          "auprc_vs_parent": 0.03422532964557079,
           "runtime_seconds": 89.18961912300438,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0004/ml.py\n+++ 0006/ml.py\n@@ -80,14 +80,18 @@\n class Model(torch.nn.Module):\n     def __init__(self, embedding_dim=768):\n         super().__init__()\n-        self.embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n+        self.peptide_embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n+        self.hla_embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n+        self.tcr_embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n         self.conv1 = torch.nn.Conv1d(embedding_dim, 128, kernel_size=3, padding=1)\n         self.fc1 = torch.nn.Linear(128, 1)\n \n     def forward(self, peptide, hla, tcr):\n-        tokens = torch.cat([peptide, hla, tcr], dim=1)\n-        mask = tokens.ne(0).unsqueeze(-1)\n-        embeddings = self.embedding(tokens)\n+        peptide_embeddings = self.peptide_embedding(peptide)\n+        hla_embeddings = self.hla_embedding(hla)\n+        tcr_embeddings = self.tcr_embedding(tcr)\n+        embeddings = torch.cat([peptide_embeddings, hla_embeddings, tcr_embeddings], dim=1)\n+        mask = torch.cat([peptide.ne(0), hla.ne(0), tcr.ne(0)], dim=1).unsqueeze(-1)\n         conv = self.conv1(embeddings.transpose(1, 2))\n         conv = torch.relu(conv)\n         mask_float = mask.to(conv.dtype).transpose(1, 2)"
         },
         {
           "id": "0007",
@@ -1410,8 +1613,11 @@
           "validation_auprc": 0.7286479828032741,
           "validation_loss": 0.19728544982855528,
           "auroc_vs_parent": 0.013930750938314862,
+          "auprc_vs_parent": 0.004725409090327259,
           "runtime_seconds": 97.34021832467988,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0006/ml.py\n+++ 0007/ml.py\n@@ -84,6 +84,7 @@\n         self.hla_embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n         self.tcr_embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n         self.conv1 = torch.nn.Conv1d(embedding_dim, 128, kernel_size=3, padding=1)\n+        self.conv2 = torch.nn.Conv1d(128, 128, kernel_size=3, padding=1)\n         self.fc1 = torch.nn.Linear(128, 1)\n \n     def forward(self, peptide, hla, tcr):\n@@ -93,6 +94,8 @@\n         embeddings = torch.cat([peptide_embeddings, hla_embeddings, tcr_embeddings], dim=1)\n         mask = torch.cat([peptide.ne(0), hla.ne(0), tcr.ne(0)], dim=1).unsqueeze(-1)\n         conv = self.conv1(embeddings.transpose(1, 2))\n+        conv = torch.relu(conv)\n+        conv = self.conv2(conv)\n         conv = torch.relu(conv)\n         mask_float = mask.to(conv.dtype).transpose(1, 2)\n         pooled = conv.masked_fill(~mask_float.bool(), float(\"-inf\")).max(dim=2).values"
         },
         {
           "id": "0008",
@@ -1425,8 +1631,11 @@
           "validation_auprc": 0.742564855478443,
           "validation_loss": 0.19660244203964217,
           "auroc_vs_parent": 0.0002532017305102441,
+          "auprc_vs_parent": 0.013916872675168834,
           "runtime_seconds": 105.34502346115187,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0007/ml.py\n+++ 0008/ml.py\n@@ -85,6 +85,7 @@\n         self.tcr_embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n         self.conv1 = torch.nn.Conv1d(embedding_dim, 128, kernel_size=3, padding=1)\n         self.conv2 = torch.nn.Conv1d(128, 128, kernel_size=3, padding=1)\n+        self.conv3 = torch.nn.Conv1d(128, 128, kernel_size=3, padding=1)\n         self.fc1 = torch.nn.Linear(128, 1)\n \n     def forward(self, peptide, hla, tcr):\n@@ -96,6 +97,8 @@\n         conv = self.conv1(embeddings.transpose(1, 2))\n         conv = torch.relu(conv)\n         conv = self.conv2(conv)\n+        conv = torch.relu(conv)\n+        conv = self.conv3(conv)\n         conv = torch.relu(conv)\n         mask_float = mask.to(conv.dtype).transpose(1, 2)\n         pooled = conv.masked_fill(~mask_float.bool(), float(\"-inf\")).max(dim=2).values"
         },
         {
           "id": "0009",
@@ -1440,8 +1649,10 @@
           "validation_auprc": 0.7284068112583444,
           "validation_loss": 0.19647235030057134,
           "auroc_vs_parent": -0.006972000974128423,
+          "auprc_vs_parent": -0.014158044220098587,
           "runtime_seconds": 107.5437882351689,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0010",
@@ -1455,8 +1666,10 @@
           "validation_auprc": 0.7399939730433446,
           "validation_loss": 0.19493001315015374,
           "auroc_vs_parent": 0.004842348795232598,
+          "auprc_vs_parent": 0.011587161785000188,
           "runtime_seconds": 108.14293812215328,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0011",
@@ -1470,8 +1683,10 @@
           "validation_auprc": 0.7294915739300709,
           "validation_loss": 0.19732037122852011,
           "auroc_vs_parent": -0.0006516273672749762,
+          "auprc_vs_parent": -0.010502399113273664,
           "runtime_seconds": 108.39355535898358,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0012",
@@ -1485,8 +1700,11 @@
           "validation_auprc": 0.74189539035912,
           "validation_loss": 0.19649702129120458,
           "auroc_vs_parent": 0.0029902515543076547,
+          "auprc_vs_parent": 0.012403816429049086,
           "runtime_seconds": 108.49356455728412,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0011/ml.py\n+++ 0012/ml.py\n@@ -89,6 +89,7 @@\n         self.fc1 = torch.nn.Linear(128, 1)\n         self.layer_norm = torch.nn.LayerNorm(128)\n         self.dropout = torch.nn.Dropout(0.1)\n+        self.temperature = torch.nn.Parameter(torch.tensor(1.0))\n \n     def forward(self, peptide, hla, tcr):\n         peptide_embeddings = self.peptide_embedding(peptide)\n@@ -109,7 +110,7 @@\n         pooled = conv.masked_fill(~mask_float.bool(), float(\"-inf\")).max(dim=2).values\n         pooled = self.dropout(pooled)\n         normalized = self.layer_norm(pooled)\n-        return torch.sigmoid(self.fc1(normalized))\n+        return torch.sigmoid(self.fc1(normalized) / self.temperature.clamp(min=1e-3))\n \n \n def evaluate_model(model, val_loader, device, criterion):"
         },
         {
           "id": "0013",
@@ -1500,8 +1718,11 @@
           "validation_auprc": 0.7423291253171851,
           "validation_loss": 0.1954986018742631,
           "auroc_vs_parent": 0.00043352290634046664,
+          "auprc_vs_parent": 0.00043373495806509066,
           "runtime_seconds": 108.39024213980883,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0012/ml.py\n+++ 0013/ml.py\n@@ -89,7 +89,6 @@\n         self.fc1 = torch.nn.Linear(128, 1)\n         self.layer_norm = torch.nn.LayerNorm(128)\n         self.dropout = torch.nn.Dropout(0.1)\n-        self.temperature = torch.nn.Parameter(torch.tensor(1.0))\n \n     def forward(self, peptide, hla, tcr):\n         peptide_embeddings = self.peptide_embedding(peptide)\n@@ -110,7 +109,7 @@\n         pooled = conv.masked_fill(~mask_float.bool(), float(\"-inf\")).max(dim=2).values\n         pooled = self.dropout(pooled)\n         normalized = self.layer_norm(pooled)\n-        return torch.sigmoid(self.fc1(normalized) / self.temperature.clamp(min=1e-3))\n+        return torch.sigmoid(self.fc1(normalized) / 2.0)\n \n \n def evaluate_model(model, val_loader, device, criterion):"
         },
         {
           "id": "0014",
@@ -1515,8 +1736,10 @@
           "validation_auprc": 0.7337304861377909,
           "validation_loss": 0.199861541644134,
           "auroc_vs_parent": -0.007538033979887171,
+          "auprc_vs_parent": -0.008598639179394185,
           "runtime_seconds": 108.24445592518896,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0015",
@@ -1530,8 +1753,10 @@
           "validation_auprc": 0.7275637978171696,
           "validation_loss": 0.19725134446862314,
           "auroc_vs_parent": -0.0002578574907601272,
+          "auprc_vs_parent": -0.006166688320621283,
           "runtime_seconds": 108.19336025090888,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0016",
@@ -1545,8 +1770,10 @@
           "validation_auprc": 0.7279407971710279,
           "validation_loss": 0.19978378220197926,
           "auroc_vs_parent": -0.0017783213477351456,
+          "auprc_vs_parent": 0.000376999353858265,
           "runtime_seconds": 108.39432177785784,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0017",
@@ -1560,8 +1787,10 @@
           "validation_auprc": 0.7288814551614478,
           "validation_loss": 0.19774222598456026,
           "auroc_vs_parent": 0.003771703005472249,
+          "auprc_vs_parent": 0.0009406579904198686,
           "runtime_seconds": 107.64513944089413,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0018",
@@ -1575,8 +1804,10 @@
           "validation_auprc": 0.7358701642860592,
           "validation_loss": 0.1966859715604172,
           "auroc_vs_parent": 0.0026265650517148798,
+          "auprc_vs_parent": 0.00698870912461147,
           "runtime_seconds": 108.19269447494298,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0019",
@@ -1590,8 +1821,10 @@
           "validation_auprc": 0.7282901521449496,
           "validation_loss": 0.1983962636934093,
           "auroc_vs_parent": -0.003399779388591262,
+          "auprc_vs_parent": -0.007580012141109593,
           "runtime_seconds": 107.69272650312632,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0020",
@@ -1605,8 +1838,10 @@
           "validation_auprc": 0.7293972392772061,
           "validation_loss": 0.19857295631597321,
           "auroc_vs_parent": -0.00013107755780306096,
+          "auprc_vs_parent": 0.0011070871322564901,
           "runtime_seconds": 108.2433231822215,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0021",
@@ -1620,8 +1855,10 @@
           "validation_auprc": 0.7418132025457165,
           "validation_loss": 0.19893647932765848,
           "auroc_vs_parent": -0.0014407787296221164,
+          "auprc_vs_parent": 0.012415963268510355,
           "runtime_seconds": 107.8424925878644,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0022",
@@ -1635,8 +1872,10 @@
           "validation_auprc": 0.7257407215392058,
           "validation_loss": 0.19711372645678155,
           "auroc_vs_parent": -0.0032601065810962115,
+          "auprc_vs_parent": -0.016824133939237207,
           "runtime_seconds": 105.84665782889351,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0023",
@@ -1650,8 +1889,11 @@
           "validation_auprc": 0.7312332952321827,
           "validation_loss": 0.19774389963424133,
           "auroc_vs_parent": 0.007554150073059596,
+          "auprc_vs_parent": 0.005492573692976954,
           "runtime_seconds": 104.6931759561412,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0022/ml.py\n+++ 0023/ml.py\n@@ -87,6 +87,7 @@\n         self.conv2 = torch.nn.Conv1d(128, 128, kernel_size=3, padding=2, dilation=2)\n         self.conv3 = torch.nn.Conv1d(128, 128, kernel_size=3, padding=1)\n         self.fc1 = torch.nn.Linear(128, 1)\n+        self.temperature = torch.nn.Parameter(torch.tensor(2.0))\n \n     def forward(self, peptide, hla, tcr):\n         peptide_embeddings = self.peptide_embedding(peptide)\n@@ -102,7 +103,7 @@\n         conv = torch.relu(conv)\n         mask_float = mask.to(conv.dtype).transpose(1, 2)\n         pooled = conv.masked_fill(~mask_float.bool(), float(\"-inf\")).max(dim=2).values\n-        return torch.sigmoid(self.fc1(pooled))\n+        return torch.sigmoid(self.fc1(pooled) / self.temperature.clamp(min=0.125, max=8.0))\n \n \n def evaluate_model(model, val_loader, device, criterion):"
         },
         {
           "id": "0024",
@@ -1665,8 +1907,10 @@
           "validation_auprc": 0.7251749941627103,
           "validation_loss": 0.19818758197156616,
           "auroc_vs_parent": 0.0013716585966823125,
+          "auprc_vs_parent": -0.0005657273764955173,
           "runtime_seconds": 104.49236386269331,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0025",
@@ -1680,8 +1924,11 @@
           "validation_auprc": 0.7411531952093177,
           "validation_loss": 0.19699486112174946,
           "auroc_vs_parent": 0.008684783542961982,
+          "auprc_vs_parent": 0.01597820104660741,
           "runtime_seconds": 105.029725917615,
-          "error": null
+          "error": null,
+          "improved": true,
+          "diff": "--- 0024/ml.py\n+++ 0025/ml.py\n@@ -102,7 +102,7 @@\n         conv = torch.relu(conv)\n         mask_float = mask.to(conv.dtype).transpose(1, 2)\n         pooled = conv.masked_fill(~mask_float.bool(), float(\"-inf\")).max(dim=2).values\n-        return torch.sigmoid(self.fc1(pooled) / 2.0)\n+        return torch.sigmoid(self.fc1(pooled) / 1.75)\n \n \n def evaluate_model(model, val_loader, device, criterion):"
         },
         {
           "id": "0026",
@@ -1695,8 +1942,10 @@
           "validation_auprc": 0.7205417620225134,
           "validation_loss": 0.19882037192895444,
           "auroc_vs_parent": -0.013305804658625409,
+          "auprc_vs_parent": -0.02061143318680425,
           "runtime_seconds": 104.69336622999981,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0027",
@@ -1710,8 +1959,10 @@
           "validation_auprc": 0.7311073622379686,
           "validation_loss": 0.19724422521643428,
           "auroc_vs_parent": 0.004879953012634997,
+          "auprc_vs_parent": 0.010565600215455162,
           "runtime_seconds": 105.34377098409459,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0028",
@@ -1725,8 +1976,10 @@
           "validation_auprc": 0.7149993566636775,
           "validation_loss": 0.19844805048239564,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": 104.39195869863033,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0029",
@@ -1740,8 +1993,10 @@
           "validation_auprc": 0.7317589210136901,
           "validation_loss": 0.1969228896073956,
           "auroc_vs_parent": 0.004980230925708318,
+          "auprc_vs_parent": 0.01675956435001258,
           "runtime_seconds": 105.14105059579015,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0030",
@@ -1755,8 +2010,10 @@
           "validation_auprc": 0.7272637287908321,
           "validation_loss": 0.1999184467032269,
           "auroc_vs_parent": -0.009663925737042778,
+          "auprc_vs_parent": -0.01506539652635297,
           "runtime_seconds": 108.44490071991459,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0031",
@@ -1770,8 +2027,10 @@
           "validation_auprc": 0.739472901609881,
           "validation_loss": 0.19852923758835128,
           "auroc_vs_parent": 0.003641162650775076,
+          "auprc_vs_parent": 0.012209172819048875,
           "runtime_seconds": 108.29482963541523,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0032",
@@ -1785,8 +2044,10 @@
           "validation_auprc": 0.7408244135789132,
           "validation_loss": 0.19697135038973518,
           "auroc_vs_parent": 0.003981033149012991,
+          "auprc_vs_parent": 0.0013515119690321598,
           "runtime_seconds": 108.59554647561163,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0033",
@@ -1800,8 +2061,10 @@
           "validation_auprc": 0.7324497283187414,
           "validation_loss": 0.19903454253167793,
           "auroc_vs_parent": -0.00357920522591193,
+          "auprc_vs_parent": -0.00837468526017171,
           "runtime_seconds": 108.54637809889391,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0034",
@@ -1815,8 +2078,10 @@
           "validation_auprc": 0.7307657938024112,
           "validation_loss": 0.19771154712885186,
           "auroc_vs_parent": 0.0018508437670113898,
+          "auprc_vs_parent": -0.0016839345163301989,
           "runtime_seconds": 108.29262348404154,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0035",
@@ -1830,8 +2095,10 @@
           "validation_auprc": 0.7432976030675886,
           "validation_loss": 0.19754183591025673,
           "auroc_vs_parent": 0.0011048477208264185,
+          "auprc_vs_parent": 0.012531809265177385,
           "runtime_seconds": 108.04654665710405,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0036",
@@ -1845,8 +2112,10 @@
           "validation_auprc": 0.7419366320038,
           "validation_loss": 0.19760949211979026,
           "auroc_vs_parent": -0.001432183479930127,
+          "auprc_vs_parent": -0.0013609710637886296,
           "runtime_seconds": 108.34684498095885,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0037",
@@ -1860,8 +2129,10 @@
           "validation_auprc": 0.732728027042219,
           "validation_loss": 0.19972071503766353,
           "auroc_vs_parent": -0.004130017477007586,
+          "auprc_vs_parent": -0.009208604961581046,
           "runtime_seconds": 108.06228005001321,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0038",
@@ -1875,8 +2146,10 @@
           "validation_auprc": 0.7341795218543499,
           "validation_loss": 0.19836012251801702,
           "auroc_vs_parent": 0.0027540612554795008,
+          "auprc_vs_parent": 0.0014514948121309157,
           "runtime_seconds": 108.24158023297787,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0039",
@@ -1890,8 +2163,10 @@
           "validation_auprc": 0.7410071244947489,
           "validation_loss": 0.1961835521293269,
           "auroc_vs_parent": 0.004694080738045336,
+          "auprc_vs_parent": 0.006827602640399055,
           "runtime_seconds": 108.49541722098365,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0040",
@@ -1905,8 +2180,10 @@
           "validation_auprc": 0.7339349851214666,
           "validation_loss": 0.1980630648278483,
           "auroc_vs_parent": -0.003999118986906525,
+          "auprc_vs_parent": -0.007072139373282327,
           "runtime_seconds": 108.14353244006634,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0041",
@@ -1920,8 +2197,10 @@
           "validation_auprc": 0.7344014634388978,
           "validation_loss": 0.19754469878282357,
           "auroc_vs_parent": 0.0008056255909233423,
+          "auprc_vs_parent": 0.00046647831743118484,
           "runtime_seconds": 108.03021160885692,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0042",
@@ -1935,8 +2214,10 @@
           "validation_auprc": 0.7345328677553069,
           "validation_loss": 0.1969685302872662,
           "auroc_vs_parent": 0.00048008050883874276,
+          "auprc_vs_parent": 0.00013140431640912276,
           "runtime_seconds": 107.74418828357011,
-          "error": null
+          "error": null,
+          "improved": false
         },
         {
           "id": "0043",
@@ -1950,8 +2231,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0044",
@@ -1965,8 +2248,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0045",
@@ -1980,8 +2265,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0046",
@@ -1995,8 +2282,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0047",
@@ -2010,8 +2299,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0048",
@@ -2025,8 +2316,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0049",
@@ -2040,8 +2333,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0050",
@@ -2055,8 +2350,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0051",
@@ -2070,8 +2367,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0052",
@@ -2085,8 +2384,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0053",
@@ -2100,8 +2401,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0054",
@@ -2115,8 +2418,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0055",
@@ -2130,8 +2435,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0056",
@@ -2145,8 +2452,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0057",
@@ -2160,8 +2469,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0058",
@@ -2175,8 +2486,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0059",
@@ -2190,8 +2503,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0060",
@@ -2205,8 +2520,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0061",
@@ -2220,8 +2537,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0062",
@@ -2235,8 +2554,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0063",
@@ -2250,8 +2571,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0064",
@@ -2265,8 +2588,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0065",
@@ -2280,8 +2605,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0066",
@@ -2295,8 +2622,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0067",
@@ -2310,8 +2639,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0068",
@@ -2325,8 +2656,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0069",
@@ -2340,8 +2673,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0070",
@@ -2355,8 +2690,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0071",
@@ -2370,8 +2707,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0072",
@@ -2385,8 +2724,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0073",
@@ -2400,8 +2741,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0074",
@@ -2415,8 +2758,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0075",
@@ -2430,8 +2775,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0076",
@@ -2445,8 +2792,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0077",
@@ -2460,8 +2809,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0078",
@@ -2475,8 +2826,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0079",
@@ -2490,8 +2843,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0080",
@@ -2505,8 +2860,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0081",
@@ -2520,8 +2877,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0082",
@@ -2535,8 +2894,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0083",
@@ -2550,8 +2911,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0084",
@@ -2565,8 +2928,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0085",
@@ -2580,8 +2945,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0086",
@@ -2595,8 +2962,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0087",
@@ -2610,8 +2979,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0088",
@@ -2625,8 +2996,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0089",
@@ -2640,8 +3013,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0090",
@@ -2655,8 +3030,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0091",
@@ -2670,8 +3047,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0092",
@@ -2685,8 +3064,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0093",
@@ -2700,8 +3081,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0094",
@@ -2715,8 +3098,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0095",
@@ -2730,8 +3115,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0096",
@@ -2745,8 +3132,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0097",
@@ -2760,8 +3149,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0098",
@@ -2775,8 +3166,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0099",
@@ -2790,8 +3183,10 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
         },
         {
           "id": "0100",
@@ -2805,8 +3200,177 @@
           "validation_auprc": null,
           "validation_loss": null,
           "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
           "runtime_seconds": null,
-          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed"
+          "error": "RuntimeError: Full history exceeds input-token budget; no truncation performed",
+          "improved": false
+        }
+      ]
+    },
+    {
+      "id": "20261025-102818-91e9",
+      "started_at": "2026-10-25T10:28:18.283833+00:00",
+      "provider": "gemini",
+      "model": "gemini-3.1-pro-preview",
+      "context_tokens": 50421,
+      "conclusion": "During this autonomous modeling session, validation AUROC was initially raised by introducing a 1D CNN over the embedded sequences, replacing mean pooling with global max pooling and negative padding masking. Performance improved further by widening the architecture\u2014increasing the embedding dimension from 64 to 128 and the convolutional filters from 128 to 256. Finally, stacking a second Conv1D layer with 256 filters and a kernel size of 5 prior to pooling yielded the strongest model. This progression ultimately achieved a best validation AUROC of 0.7794 and an AUPRC of 0.7418.",
+      "conclusion_key": "3ec34ee5c5c5ced38b75ba759122ba8741ae0f4e22a06532d60790c92352573a",
+      "experiments": [
+        {
+          "id": "0001",
+          "timestamp": "2026-10-25T10:29:06.530132+00:00",
+          "status": "valid",
+          "parent": "starter",
+          "title": "Unchanged starter baseline",
+          "hypothesis": "The starter ml.py is a valid sequence-only baseline before any experimental change.",
+          "change": "Copy the starter ml.py unchanged.",
+          "validation_auroc": 0.5011415565997193,
+          "validation_auprc": 0.5025428980651772,
+          "validation_loss": 0.2500016937609669,
+          "auroc_vs_parent": null,
+          "auprc_vs_parent": null,
+          "runtime_seconds": 47.4274550746195,
+          "error": null,
+          "improved": false
+        },
+        {
+          "id": "0002",
+          "timestamp": "2026-10-25T10:30:12.455092+00:00",
+          "status": "valid",
+          "parent": "0001",
+          "title": "1D CNN with max pooling",
+          "hypothesis": "Replacing the order-invariant mean pooling with a 1D Convolutional layer and max-pooling will allow the model to capture local amino-acid motifs important for binding.",
+          "change": "Add a Conv1D layer over the embedded sequences, apply ReLU, mask padding with a large negative value, and use global max pooling instead of mean pooling.",
+          "validation_auroc": 0.7192073389106953,
+          "validation_auprc": 0.6666207064240128,
+          "validation_loss": 0.21657939334127468,
+          "auroc_vs_parent": 0.21806578231097606,
+          "auprc_vs_parent": 0.16407780835883568,
+          "runtime_seconds": 48.52776305517182,
+          "error": null,
+          "improved": true,
+          "diff": "--- 0001/ml.py\n+++ 0002/ml.py\n@@ -78,16 +78,22 @@\n \n \n class Model(torch.nn.Module):\n-    def __init__(self, embedding_dim=768):\n+    def __init__(self, embedding_dim=64):\n         super().__init__()\n         self.embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n-        self.fc1 = torch.nn.Linear(embedding_dim, 1)\n+        self.conv = torch.nn.Conv1d(embedding_dim, 128, kernel_size=5, padding=2)\n+        self.relu = torch.nn.ReLU()\n+        self.fc1 = torch.nn.Linear(128, 1)\n \n     def forward(self, peptide, hla, tcr):\n         tokens = torch.cat([peptide, hla, tcr], dim=1)\n         mask = tokens.ne(0).unsqueeze(-1)\n         embeddings = self.embedding(tokens)\n-        pooled = (embeddings * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)\n+        x = embeddings.transpose(1, 2)\n+        x = self.relu(self.conv(x))\n+        x = x.transpose(1, 2)\n+        x = x.masked_fill(~mask, -1e9)\n+        pooled = x.max(dim=1)[0]\n         return torch.sigmoid(self.fc1(pooled))\n \n "
+        },
+        {
+          "id": "0003",
+          "timestamp": "2026-10-25T10:31:22.432661+00:00",
+          "status": "valid",
+          "parent": "0002",
+          "title": "Multi-scale 1D CNN with max pooling",
+          "hypothesis": "Using multiple parallel 1D convolutional layers with different kernel sizes will capture short, medium, and long amino acid motifs, improving binding prediction.",
+          "change": "Replace the single Conv1D layer with three parallel Conv1D layers (kernel sizes 3, 5, 7), max-pool each separately over the sequence, and concatenate their pooled representations.",
+          "validation_auroc": 0.7184144271266081,
+          "validation_auprc": 0.6757027802431628,
+          "validation_loss": 0.2160034710487374,
+          "auroc_vs_parent": -0.0007929117840872468,
+          "auprc_vs_parent": 0.009082073819149938,
+          "runtime_seconds": 52.52900637825951,
+          "error": null,
+          "improved": false
+        },
+        {
+          "id": "0004",
+          "timestamp": "2026-10-25T10:32:34.123238+00:00",
+          "status": "valid",
+          "parent": "0002",
+          "title": "Max and Average Pooling concat",
+          "hypothesis": "Concatenating global max pooling and global average pooling captures both salient local motifs and global sequence composition, improving prediction robustness.",
+          "change": "Add global average pooling alongside max pooling in the forward pass of the CNN model and concatenate their outputs.",
+          "validation_auroc": 0.7166017247801049,
+          "validation_auprc": 0.666597208885715,
+          "validation_loss": 0.2169457475332237,
+          "auroc_vs_parent": -0.002605614130590461,
+          "auprc_vs_parent": -2.3497538297778675e-05,
+          "runtime_seconds": 50.98267842317,
+          "error": null,
+          "improved": false
+        },
+        {
+          "id": "0005",
+          "timestamp": "2026-10-25T10:33:39.376153+00:00",
+          "status": "valid",
+          "parent": "0002",
+          "title": "MLP head with dropout",
+          "hypothesis": "Adding an MLP head with dropout to the CNN max-pooling features will increase capacity and reduce overfitting, leading to better generalization.",
+          "change": "Replace the single linear layer in the CNN model with a two-layer MLP and dropout.",
+          "validation_auroc": 0.6933256095464573,
+          "validation_auprc": 0.6523970679306964,
+          "validation_loss": 0.22318884419041707,
+          "auroc_vs_parent": -0.02588172936423805,
+          "auprc_vs_parent": -0.014223638493316426,
+          "runtime_seconds": 48.77962476015091,
+          "error": null,
+          "improved": false
+        },
+        {
+          "id": "0006",
+          "timestamp": "2026-10-25T10:34:54.625151+00:00",
+          "status": "valid",
+          "parent": "0002",
+          "title": "Wider 1D CNN",
+          "hypothesis": "Increasing the embedding dimension and the number of convolutional filters will provide the model with a higher capacity to extract and represent relevant local amino acid motifs.",
+          "change": "Increase the embedding dimension from 64 to 128, the convolutional filters from 128 to 256, and adjust the linear layer accordingly.",
+          "validation_auroc": 0.7492328739649887,
+          "validation_auprc": 0.7104972303125441,
+          "validation_loss": 0.20517152044008202,
+          "auroc_vs_parent": 0.030025535054293395,
+          "auprc_vs_parent": 0.04387652388853125,
+          "runtime_seconds": 61.93262722482905,
+          "error": null,
+          "improved": true,
+          "diff": "--- 0002/ml.py\n+++ 0006/ml.py\n@@ -78,12 +78,12 @@\n \n \n class Model(torch.nn.Module):\n-    def __init__(self, embedding_dim=64):\n+    def __init__(self, embedding_dim=128):\n         super().__init__()\n         self.embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n-        self.conv = torch.nn.Conv1d(embedding_dim, 128, kernel_size=5, padding=2)\n+        self.conv = torch.nn.Conv1d(embedding_dim, 256, kernel_size=5, padding=2)\n         self.relu = torch.nn.ReLU()\n-        self.fc1 = torch.nn.Linear(128, 1)\n+        self.fc1 = torch.nn.Linear(256, 1)\n \n     def forward(self, peptide, hla, tcr):\n         tokens = torch.cat([peptide, hla, tcr], dim=1)"
+        },
+        {
+          "id": "0007",
+          "timestamp": "2026-10-25T10:36:39.024757+00:00",
+          "status": "valid",
+          "parent": "0006",
+          "title": "Two-layer wider CNN",
+          "hypothesis": "Adding a second convolutional layer to the wider CNN model will increase the receptive field and depth, allowing it to capture more complex, hierarchical amino acid motifs.",
+          "change": "Add a second Conv1D layer (256 filters, kernel size 5) with a ReLU activation before the global max pooling.",
+          "validation_auroc": 0.7794333581640547,
+          "validation_auprc": 0.7417521083488889,
+          "validation_loss": 0.1948318050797506,
+          "auroc_vs_parent": 0.030200484199065958,
+          "auprc_vs_parent": 0.03125487803634486,
+          "runtime_seconds": 87.73860593093559,
+          "error": null,
+          "improved": true,
+          "diff": "--- 0006/ml.py\n+++ 0007/ml.py\n@@ -81,7 +81,8 @@\n     def __init__(self, embedding_dim=128):\n         super().__init__()\n         self.embedding = torch.nn.Embedding(21, embedding_dim, padding_idx=0)\n-        self.conv = torch.nn.Conv1d(embedding_dim, 256, kernel_size=5, padding=2)\n+        self.conv1 = torch.nn.Conv1d(embedding_dim, 256, kernel_size=5, padding=2)\n+        self.conv2 = torch.nn.Conv1d(256, 256, kernel_size=5, padding=2)\n         self.relu = torch.nn.ReLU()\n         self.fc1 = torch.nn.Linear(256, 1)\n \n@@ -90,7 +91,8 @@\n         mask = tokens.ne(0).unsqueeze(-1)\n         embeddings = self.embedding(tokens)\n         x = embeddings.transpose(1, 2)\n-        x = self.relu(self.conv(x))\n+        x = self.relu(self.conv1(x))\n+        x = self.relu(self.conv2(x))\n         x = x.transpose(1, 2)\n         x = x.masked_fill(~mask, -1e9)\n         pooled = x.max(dim=1)[0]"
+        },
+        {
+          "id": "0008",
+          "timestamp": "2026-10-25T10:38:58.960478+00:00",
+          "status": "valid",
+          "parent": "0007",
+          "title": "Three-layer wide CNN",
+          "hypothesis": "Increasing the CNN depth to three layers expands the receptive field and allows extraction of more complex sequence motifs, further improving prediction over the two-layer network.",
+          "change": "Add a third Conv1D layer with 256 filters and kernel size 5 to the model.",
+          "validation_auroc": 0.7784445463140703,
+          "validation_auprc": 0.7509526404786243,
+          "validation_loss": 0.19321021411042272,
+          "auroc_vs_parent": -0.000988811849984339,
+          "auprc_vs_parent": 0.009200532129735373,
+          "runtime_seconds": 113.49527399521321,
+          "error": null,
+          "improved": false
+        },
+        {
+          "id": "0009",
+          "timestamp": "2026-10-25T10:41:28.915448+00:00",
+          "status": "valid",
+          "parent": "0008",
+          "title": "CNN with BatchNorm and Dropout",
+          "hypothesis": "Adding Batch Normalization and Dropout to the deep CNN will help stabilize training and reduce overfitting, leading to improved generalization.",
+          "change": "Introduce BatchNorm1d and Dropout after each convolutional layer in the three-layer CNN.",
+          "validation_auroc": 0.7235696071970891,
+          "validation_auprc": 0.6862737549045217,
+          "validation_loss": 0.20977149635781556,
+          "auroc_vs_parent": -0.05487493911698127,
+          "auprc_vs_parent": -0.06467888557410262,
+          "runtime_seconds": 132.35108859930187,
+          "error": null,
+          "improved": false
         }
       ]
     }

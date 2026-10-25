@@ -374,28 +374,35 @@ function renderLegend() {
 function renderSessions() {
   sessionList.replaceChildren();
   state.data.sessions.forEach((session) => {
-    const item = document.createElement("li");
-    const button = document.createElement("button");
-    button.type = "button";
-    if (state.focus && state.focus !== session.id) button.classList.add("is-dim");
+    const row = document.createElement("tr");
+    if (state.focus && state.focus !== session.id) row.classList.add("is-dim");
+    const model = document.createElement("th");
+    model.scope = "row";
     const swatch = document.createElement("span");
     swatch.className = bestMetric(session, "validation_auroc") === null ? "swatch is-empty" : "swatch";
     swatch.style.color = modelStyle(session.model).color;
-    const sid = document.createElement("span");
-    sid.className = "sid";
-    sid.textContent = `${session.model || "unknown model"} · ${session.id}`;
-    const stats = document.createElement("span");
-    stats.className = "stats";
-    const n = session.experiments.length;
-    stats.textContent = `${fmtCount(n)} experiment${n === 1 ? "" : "s"} · ${fmtCount(session.context_tokens)} context tokens · AUROC ${fmt(bestMetric(session, "validation_auroc"))} · AUPRC ${fmt(bestMetric(session, "validation_auprc"))}`;
-    button.append(swatch, sid, stats);
-    button.addEventListener("click", () => {
-      state.focus = state.focus === session.id ? null : session.id;
-      renderSessions();
-      renderPlots();
+    const link = document.createElement("a");
+    link.href = `./session.html?id=${encodeURIComponent(session.id)}`;
+    link.textContent = session.model || "unknown model";
+    model.append(swatch, link);
+    const cells = [
+      session.id,
+      fmtCount(session.experiments.length),
+      fmtCount(session.context_tokens),
+      fmt(bestMetric(session, "validation_auroc")),
+      fmt(bestMetric(session, "validation_auprc")),
+    ].map((value) => {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      return cell;
     });
-    item.append(button);
-    sessionList.append(item);
+    cells[0].replaceChildren();
+    const sessionLink = document.createElement("a");
+    sessionLink.href = `./session.html?id=${encodeURIComponent(session.id)}`;
+    sessionLink.textContent = session.id;
+    cells[0].append(sessionLink);
+    row.append(model, ...cells);
+    sessionList.append(row);
   });
 }
 

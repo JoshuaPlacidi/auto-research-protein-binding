@@ -12,7 +12,29 @@
   <header>
     <p class="kicker">Autonomous research</p>
     <h1>TCR–pMHC binding</h1>
-    <p class="intro">We built a general experiment harness and asked different AIs to research and train models for TCR–pMHC binding prediction. Each line is one model iterating on its own.</p>
+    <p class="intro">We built a general experiment harness and asked different AIs to research and train models for TCR–pMHC binding prediction. Each line is one model iterating on its own. Dashed lines are two VICReg sequence baselines trained before the search, on the same validation cohort.</p>
+    <table class="baselines">
+      <caption class="visually-hidden">Validation scores of the sequence baselines</caption>
+      <thead>
+        <tr>
+          <th scope="col">Baseline</th>
+          <th scope="col">AUROC</th>
+          <th scope="col">AUPRC</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <th scope="row">One-hot VICReg</th>
+          <td>0.733 ± 0.002</td>
+          <td>0.721 ± 0.003</td>
+        </tr>
+        <tr>
+          <th scope="row">Raw ESMC VICReg</th>
+          <td>0.809 ± 0.004</td>
+          <td>0.803 ± 0.003</td>
+        </tr>
+      </tbody>
+    </table>
     <ul class="legend" id="legend" aria-label="Models"></ul>
   </header>
 
@@ -31,7 +53,19 @@
       <p class="kicker">Sessions</p>
       <button type="button" id="show-all" class="text-btn">All</button>
     </div>
-    <ol id="sessions"></ol>
+    <table class="sessions">
+      <thead>
+        <tr>
+          <th scope="col">Model</th>
+          <th scope="col">Session</th>
+          <th scope="col">Experiments</th>
+          <th scope="col">Context tokens</th>
+          <th scope="col">AUROC</th>
+          <th scope="col">AUPRC</th>
+        </tr>
+      </thead>
+      <tbody id="sessions"></tbody>
+    </table>
   </nav>
 
   <section id="detail" aria-live="polite"></section>
