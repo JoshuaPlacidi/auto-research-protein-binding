@@ -1,5 +1,9 @@
 # Autonomous Research for TCR–pMHC Binding
 
+## Authors
+
+[Joshua Placidi](https://joshuaplacidi.com) and [Natasha Jeans](https://www.linkedin.com/in/natasha-jeans-25747a1a6/)
+
 ![Gemini 4 Argon session playback](./figures/gemini-4-argon-playback.gif)
 
 ## TCR-pMHC Binding - The Marker of Immunity
