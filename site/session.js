@@ -75,6 +75,8 @@ function render() {
       panel.className = "expand";
       panel.innerHTML = `
         <p class="meta">AUROC ${esc(fmt(experiment.validation_auroc))} (${esc(fmtDelta(experiment.auroc_vs_parent))}) · AUPRC ${esc(fmt(experiment.validation_auprc))} (${esc(fmtDelta(experiment.auprc_vs_parent))}) · parent ${esc(experiment.parent || "—")}</p>
+        <h3>Hypothesis</h3>
+        <p>${esc(experiment.hypothesis || "Not recorded.")}</p>
         <h3>Change</h3>
         <p>${esc(experiment.change || "Not recorded.")}</p>
         <h3>ml.py</h3>
