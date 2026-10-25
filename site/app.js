@@ -52,7 +52,8 @@ function fmtCount(value) {
 }
 
 const MODELS = [
-  { test: /gemini|argon/, label: "Google DeepMind · Gemini 4 Argon", color: "#1A73E8" },
+  { test: /argon/, label: "Google DeepMind · Gemini 4 Argon", color: "#1A73E8" },
+  { test: /gemini/, label: "Google DeepMind · Gemini 3.1 Pro", color: "#174EA6" },
   { test: /flint|recursive/, label: "Recursive · Flint", color: "#574D80" },
 ];
 const OTHER_MODEL = { label: "Other", color: "#8A8478" };
@@ -378,6 +379,7 @@ function renderSessions() {
     if (state.focus && state.focus !== session.id) row.classList.add("is-dim");
     const model = document.createElement("th");
     model.scope = "row";
+    model.className = "model";
     const swatch = document.createElement("span");
     swatch.className = bestMetric(session, "validation_auroc") === null ? "swatch is-empty" : "swatch";
     swatch.style.color = modelStyle(session.model).color;
@@ -387,7 +389,7 @@ function renderSessions() {
     model.append(swatch, link);
     const cells = [
       session.id,
-      fmtCount(session.experiments.length),
+      fmtCount(session.experiments.filter((row) => row.status === "valid").length),
       fmtCount(session.context_tokens),
       fmt(bestMetric(session, "validation_auroc")),
       fmt(bestMetric(session, "validation_auprc")),

@@ -13,47 +13,8 @@
     <p class="kicker">Autonomous research</p>
     <h1>TCR–pMHC binding</h1>
     <p class="intro">We built a general experiment harness and asked different AIs to research and train models for TCR–pMHC binding prediction. Each line is one model iterating on its own. Dashed lines are two VICReg sequence baselines trained before the search, on the same validation cohort.</p>
-    <table class="baselines">
-      <caption class="visually-hidden">Validation scores of the sequence baselines</caption>
-      <thead>
-        <tr>
-          <th scope="col">Baseline</th>
-          <th scope="col">AUROC</th>
-          <th scope="col">AUPRC</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <th scope="row">One-hot VICReg</th>
-          <td>0.733 ± 0.002</td>
-          <td>0.721 ± 0.003</td>
-        </tr>
-        <tr>
-          <th scope="row">Raw ESMC VICReg</th>
-          <td>0.809 ± 0.004</td>
-          <td>0.803 ± 0.003</td>
-        </tr>
-      </tbody>
-    </table>
-    <ul class="legend" id="legend" aria-label="Models"></ul>
-  </header>
-
-  <figure class="chart">
-    <svg id="chart" viewBox="0 0 800 372" role="img" aria-label="Validation AUROC by experiment"></svg>
-    <div id="chart-tooltip" class="chart-tooltip" hidden></div>
-  </figure>
-
-  <figure class="chart">
-    <svg id="auprc" viewBox="0 0 800 372" role="img" aria-label="Validation AUPRC by experiment"></svg>
-    <div id="auprc-tooltip" class="chart-tooltip" hidden></div>
-  </figure>
-
-  <nav aria-label="Sessions">
-    <div class="nav-head">
-      <p class="kicker">Sessions</p>
-      <button type="button" id="show-all" class="text-btn">All</button>
-    </div>
-    <table class="sessions">
+    <table class="results">
+      <caption class="visually-hidden">Validation baselines and autonomous research sessions</caption>
       <thead>
         <tr>
           <th scope="col">Model</th>
@@ -64,9 +25,50 @@
           <th scope="col">AUPRC</th>
         </tr>
       </thead>
+      <tbody>
+        <tr class="panel">
+          <th scope="colgroup" colspan="6">Baselines</th>
+        </tr>
+        <tr>
+          <th scope="row">One-hot VICReg</th>
+          <td>—</td>
+          <td>—</td>
+          <td>—</td>
+          <td>0.733 ± 0.002</td>
+          <td>0.721 ± 0.003</td>
+        </tr>
+        <tr>
+          <th scope="row">Raw ESMC VICReg</th>
+          <td>—</td>
+          <td>—</td>
+          <td>—</td>
+          <td>0.809 ± 0.004</td>
+          <td>0.803 ± 0.003</td>
+        </tr>
+      </tbody>
+      <tbody>
+        <tr class="panel">
+          <th scope="colgroup" colspan="6">Sessions</th>
+        </tr>
+      </tbody>
       <tbody id="sessions"></tbody>
     </table>
-  </nav>
+  </header>
+
+  <div class="chart-head">
+    <ul class="legend" id="legend" aria-label="Models"></ul>
+    <button type="button" id="show-all" class="text-btn">All</button>
+  </div>
+
+  <figure class="chart">
+    <svg id="chart" viewBox="0 0 800 372" role="img" aria-label="Validation AUROC by experiment"></svg>
+    <div id="chart-tooltip" class="chart-tooltip" hidden></div>
+  </figure>
+
+  <figure class="chart">
+    <svg id="auprc" viewBox="0 0 800 372" role="img" aria-label="Validation AUPRC by experiment"></svg>
+    <div id="auprc-tooltip" class="chart-tooltip" hidden></div>
+  </figure>
 
   <section id="detail" aria-live="polite"></section>
 
