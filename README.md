@@ -53,7 +53,7 @@ The focus is contextual scientific iteration, not only model optiminsation: each
 
 ## Sequence baselines
 
-These VICReg models were trained before the autonomous search. Global AUROC is on the same complete α+β validation and test cohorts the hackathon evaluator scores.
+These VICReg models were trained before the autonomous search. Global AUROC and AUPRC are on the same complete α+β validation and test cohorts the hackathon evaluator scores.
 
 ![Sequence baselines](./figures/sequence_baseline_aucs.png)
 
