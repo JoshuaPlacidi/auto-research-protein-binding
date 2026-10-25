@@ -4,7 +4,7 @@
 
 The immune system uses T-cell receptors (TCRs) to recognise potentially harmful cells, such as viruses and cancer. Cells display small fragments of proteins, called peptides, on their surface using molecules known as MHCs, forming peptdie-MHC (pMHC) complexes. When a TCR binds to a specific pMHC complex, it signals that the T cell has recognised its target and can trigger an immune response. Predicting which TCRs bind to which pMHC complexes is therefore a fundamental step towards understanding and harnessing the immune system.
 
-[Gemini 4 Argon session playback](./figures/gemini-4-argon-playback.mp4)
+![Gemini 4 Argon session playback](./figures/gemini-4-argon-playback.gif)
 
 ![TCR–pMHC binding cartoon](./figures/tcr_pmhc_cartoon.png)
 

@@ -223,4 +223,3 @@ experiments/
 /data/
 
 *.mp4
-!figures/*.mp4
