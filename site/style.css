@@ -94,9 +94,25 @@ h1 {
 }
 
 .results .model .swatch {
+  background: currentColor;
+  border: 1px solid transparent;
+  border-radius: 1px;
+  cursor: pointer;
   display: inline-block;
-  margin-right: 0.45rem;
+  height: 0.55rem;
+  margin: 0 0.45rem 0 0;
+  padding: 0;
   vertical-align: -0.05rem;
+  width: 0.55rem;
+}
+
+.results .is-off {
+  opacity: 0.4;
+}
+
+.results .is-off .swatch {
+  background: transparent;
+  border-color: currentColor;
 }
 
 .results .is-dim {

@@ -12,6 +12,7 @@ const state = {
   focus: null,
   selected: null,
   hover: null,
+  hidden: new Set(),
 };
 
 function esc(value) {
@@ -61,6 +62,10 @@ const OTHER_MODEL = { label: "Other", color: "#8A8478" };
 function modelStyle(model) {
   const name = String(model || "").toLowerCase();
   return MODELS.find((entry) => entry.test.test(name)) || OTHER_MODEL;
+}
+
+function visibleSessions() {
+  return state.data.sessions.filter((session) => !state.hidden.has(session.id));
 }
 
 function svgEl(name, attrs) {
@@ -184,7 +189,7 @@ function pathFrom(points, layout) {
 }
 
 function renderPlot(plot) {
-  const sessions = state.data.sessions;
+  const sessions = visibleSessions();
   const layout = buildLayout(sessions, plot.metric, plot.baselines);
   plot.layout = layout;
   const focus = state.focus;
@@ -320,6 +325,7 @@ function nearestPoint(event, plot) {
   let best = null;
   let bestDist = 18;
   for (const point of plot.layout.points) {
+    if (state.hidden.has(point.session.id)) continue;
     if (state.focus && point.session.id !== state.focus) continue;
     const dx = plot.layout.xOf(point.x) - cursor.x;
     const dy = plot.layout.yOf(point.y) - cursor.y;
@@ -376,13 +382,28 @@ function renderSessions() {
   sessionList.replaceChildren();
   state.data.sessions.forEach((session) => {
     const row = document.createElement("tr");
-    if (state.focus && state.focus !== session.id) row.classList.add("is-dim");
+    const hidden = state.hidden.has(session.id);
+    if (hidden) row.classList.add("is-off");
+    else if (state.focus && state.focus !== session.id) row.classList.add("is-dim");
     const model = document.createElement("th");
     model.scope = "row";
     model.className = "model";
-    const swatch = document.createElement("span");
-    swatch.className = bestMetric(session, "validation_auroc") === null ? "swatch is-empty" : "swatch";
+    const swatch = document.createElement("button");
+    swatch.type = "button";
+    swatch.className = "swatch";
     swatch.style.color = modelStyle(session.model).color;
+    swatch.title = hidden ? "Show on charts" : "Hide on charts";
+    swatch.setAttribute("aria-pressed", hidden ? "false" : "true");
+    swatch.setAttribute("aria-label", hidden ? `Show ${session.id} on charts` : `Hide ${session.id} on charts`);
+    swatch.addEventListener("click", () => {
+      if (hidden) state.hidden.delete(session.id);
+      else {
+        state.hidden.add(session.id);
+        if (state.focus === session.id) state.focus = null;
+      }
+      renderSessions();
+      renderPlots();
+    });
     const link = document.createElement("a");
     link.href = `./session.html?id=${encodeURIComponent(session.id)}`;
     link.textContent = session.model || "unknown model";
@@ -472,6 +493,7 @@ for (const plot of plots) {
 
 showAll.addEventListener("click", () => {
   state.focus = null;
+  state.hidden.clear();
   renderSessions();
   renderPlots();
 });
