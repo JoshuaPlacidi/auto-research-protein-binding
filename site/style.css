@@ -31,7 +31,12 @@ h1 {
   font-weight: 600;
   letter-spacing: -0.03em;
   line-height: 1.25;
-  margin: 0.15rem 0 0.9rem;
+  margin: 0.15rem 0 0.7rem;
+}
+
+.intro {
+  margin: 0 0 1.4rem;
+  max-width: 38rem;
 }
 
 h2 {
@@ -274,7 +279,7 @@ p {
   line-height: 1.45;
 }
 
-#detail {
+#detail:not(:empty) {
   border-top: 1px solid var(--line);
   margin-top: 2.4rem;
   padding-top: 1.6rem;

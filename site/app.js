@@ -401,13 +401,13 @@ function renderSessions() {
 
 function renderDetail() {
   if (!state.selected) {
-    detail.innerHTML = `<p class="placeholder">Click a point on the chart.</p>`;
+    detail.innerHTML = "";
     return;
   }
   const session = state.data.sessions.find((row) => row.id === state.selected.sessionId);
   const experiment = session?.experiments.find((row) => row.id === state.selected.experimentId);
   if (!experiment) {
-    detail.innerHTML = `<p class="placeholder">Click a point on the chart.</p>`;
+    detail.innerHTML = "";
     return;
   }
   const delta = experiment.auroc_vs_parent;
