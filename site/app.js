@@ -363,21 +363,6 @@ function hideTooltip() {
   }
 }
 
-function renderLegend() {
-  const legend = document.querySelector("#legend");
-  const used = new Set(state.data.sessions.map((session) => modelStyle(session.model).label));
-  const entries = MODELS.filter((entry) => used.has(entry.label));
-  if (used.has(OTHER_MODEL.label)) entries.push(OTHER_MODEL);
-  legend.replaceChildren();
-  for (const entry of entries) {
-    const item = document.createElement("li");
-    const swatch = document.createElement("i");
-    swatch.style.background = entry.color;
-    item.append(swatch, document.createTextNode(entry.label));
-    legend.append(item);
-  }
-}
-
 function renderSessions() {
   sessionList.replaceChildren();
   state.data.sessions.forEach((session) => {
@@ -505,7 +490,6 @@ fetch("./data/sessions.json")
   })
   .then((data) => {
     state.data = data;
-    renderLegend();
     renderSessions();
     renderPlots();
     renderDetail();

@@ -6,19 +6,26 @@
   <title>Session playback</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧬</text></svg>">
   <meta name="description" content="Playback of validation AUROC and AUPRC as each research session proceeds.">
-  <link rel="stylesheet" href="./style.css?v=8">
+  <link rel="stylesheet" href="./style.css?v=16">
 </head>
 <body>
   <header>
-    <p class="kicker"><a href="./">All sessions</a></p>
+    <nav class="pages" aria-label="Pages">
+      <a href="./">Home</a>
+      <a href="./demo.html" aria-current="page">Session playback</a>
+    </nav>
     <h1>Session playback</h1>
-    <ul class="legend" id="legend" aria-label="Models"></ul>
-    <div class="demo-controls">
-      <button type="button" id="play" class="text-btn">Play</button>
-      <button type="button" id="stop" class="text-btn">Stop</button>
-      <button type="button" id="restart" class="text-btn">Restart</button>
-      <button type="button" id="notes" class="text-btn" aria-pressed="true">Notes</button>
-      <p id="progress"></p>
+    <p class="intro">Each session is replayed experiment by experiment. A point appears when that run finishes, and a note marks each new best validation score.</p>
+    <div class="playback-tools">
+      <ul class="legend" id="legend" aria-label="Models"></ul>
+      <div class="demo-controls">
+        <button type="button" id="play" class="text-btn">Play</button>
+        <button type="button" id="stop" class="text-btn">Stop</button>
+        <button type="button" id="restart" class="text-btn">Restart</button>
+        <button type="button" id="record" class="text-btn">Record</button>
+        <button type="button" id="notes" class="text-btn" aria-pressed="true">Notes</button>
+        <p id="progress"></p>
+      </div>
     </div>
   </header>
 
@@ -30,6 +37,6 @@
     <svg id="auprc" viewBox="0 0 800 372" role="img" aria-label="Validation AUPRC by experiment"></svg>
   </figure>
 
-  <script src="./demo.js?v=9"></script>
+  <script src="./demo.js?v=16"></script>
 </body>
 </html>

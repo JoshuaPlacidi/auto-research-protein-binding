@@ -6,11 +6,14 @@
   <title>TCR–pMHC research sessions</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧬</text></svg>">
   <meta name="description" content="Validation AUROC from autonomous TCR–pMHC binding experiments.">
-  <link rel="stylesheet" href="./style.css?v=5">
+  <link rel="stylesheet" href="./style.css?v=16">
 </head>
 <body>
   <header>
-    <p class="kicker">Autonomous research · <a href="./demo.html">Play</a></p>
+    <nav class="pages" aria-label="Pages">
+      <a href="./" aria-current="page">Home</a>
+      <a href="./demo.html">Session playback</a>
+    </nav>
     <h1>TCR–pMHC binding</h1>
     <p class="intro">We built a general experiment harness and asked different AIs to research and train models for TCR–pMHC binding prediction. Each line is one model iterating on its own. Dashed lines are two VICReg sequence baselines trained before the search, on the same validation cohort.</p>
     <table class="results">
@@ -56,7 +59,6 @@
   </header>
 
   <div class="chart-head">
-    <ul class="legend" id="legend" aria-label="Models"></ul>
     <button type="button" id="show-all" class="text-btn">All</button>
   </div>
 
@@ -72,6 +74,25 @@
 
   <section id="detail" aria-live="polite"></section>
 
-  <script src="./app.js?v=4"></script>
+  <footer class="credits">
+    <p>Made by</p>
+    <ul>
+      <li>
+        <a href="https://joshuaplacidi.com" target="_blank" rel="noopener noreferrer">
+          <img src="./portraits/joshua.jpg" alt="" width="52" height="52">
+          Joshua Placidi
+        </a>
+      </li>
+      <li>
+        <a href="https://www.linkedin.com/in/natasha-jeans-25747a1a6/" target="_blank" rel="noopener noreferrer">
+          <img src="./portraits/natasha.jpg" alt="" width="52" height="52">
+          Natasha Jeans
+        </a>
+      </li>
+    </ul>
+    <p class="note">Developed in under 72 hours at a hackathon at the <a href="https://www.encode.club/">Encode Club</a> in London on 25 October 2026.</p>
+  </footer>
+
+  <script src="./app.js?v=5"></script>
 </body>
 </html>

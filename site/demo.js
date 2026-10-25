@@ -26,6 +26,7 @@ const plots = [
 const playButton = document.querySelector("#play");
 const stopButton = document.querySelector("#stop");
 const restartButton = document.querySelector("#restart");
+const recordButton = document.querySelector("#record");
 const progress = document.querySelector("#progress");
 const notesButton = document.querySelector("#notes");
 const legend = document.querySelector("#legend");
@@ -38,6 +39,8 @@ const state = {
   timer: null,
   hidden: new Set(),
   notes: true,
+  recording: false,
+  keepVideo: false,
 };
 
 function esc(value) {
@@ -81,11 +84,12 @@ function buildLayout(metric) {
   let maxX = 1;
   const values = BASELINES.map((baseline) => baseline[metric]).filter((value) => typeof value === "number");
   state.sessions.forEach((session) => {
+    if (state.hidden.has(session.id)) return;
     session.experiments.forEach((experiment, index) => {
-      const x = experimentNumber(experiment, index);
-      maxX = Math.max(maxX, x);
       const score = metricValue(experiment, metric);
       if (score === null) return;
+      const x = experimentNumber(experiment, index);
+      maxX = Math.max(maxX, x);
       values.push(score);
       points.push({ x, y: score, session, experiment, index });
     });
@@ -230,6 +234,91 @@ function drawFrame(plot, layout) {
   });
 }
 
+let audioCtx = null;
+
+function audio() {
+  const Context = window.AudioContext || window.webkitAudioContext;
+  if (!Context) return null;
+  if (!audioCtx) audioCtx = new Context();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
+}
+
+const PENTATONIC = [0, 2, 4, 7, 9];
+
+function tone(frequency, delay, duration, level, type) {
+  const ctx = audio();
+  if (!ctx || ctx.state !== "running") return;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  const start = ctx.currentTime + delay;
+  osc.type = type;
+  osc.frequency.value = frequency;
+  gain.gain.setValueAtTime(0.0001, start);
+  gain.gain.exponentialRampToValueAtTime(level, start + 0.012);
+  gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  if (recordGain) gain.connect(recordGain);
+  osc.start(start);
+  osc.stop(start + duration + 0.02);
+}
+
+function pitchFor(score) {
+  const placed = Math.min(1, Math.max(0, (score - 0.5) / 0.34));
+  const steps = Math.round(placed * 14);
+  const octave = Math.floor(steps / PENTATONIC.length);
+  const midi = 60 + octave * 12 + PENTATONIC[steps % PENTATONIC.length];
+  return 440 * 2 ** ((midi - 69) / 12);
+}
+
+function shepard(score, duration, level) {
+  const frequency = pitchFor(score);
+  tone(frequency, 0, duration, level, "triangle");
+  tone(frequency / 2, 0, duration, level * 0.28, "sine");
+  tone(frequency * 2, 0.02, duration * 0.7, level * 0.12, "sine");
+}
+
+function scoreAtStep() {
+  let score = null;
+  for (const session of state.sessions) {
+    if (state.hidden.has(session.id)) continue;
+    for (let index = 0; index < session.experiments.length; index += 1) {
+      const experiment = session.experiments[index];
+      if (experimentNumber(experiment, index) !== state.step) continue;
+      const value = metricValue(experiment, "validation_auroc");
+      if (value !== null) score = score === null ? value : Math.max(score, value);
+    }
+  }
+  return score;
+}
+
+function playStepSound(finished) {
+  const bests = newBests();
+  if (bests.length) {
+    shepard(Math.max(...bests.map((hit) => hit.score)), 0.2, 0.04);
+    return;
+  }
+  const score = scoreAtStep();
+  if (score !== null) {
+    shepard(score, 0.055, 0.016);
+    return;
+  }
+  if (finished) {
+    let best = null;
+    for (const session of state.sessions) {
+      if (state.hidden.has(session.id)) continue;
+      for (let index = 0; index < session.experiments.length; index += 1) {
+        const experiment = session.experiments[index];
+        if (experimentNumber(experiment, index) > state.step) continue;
+        const value = metricValue(experiment, "validation_auroc");
+        if (value !== null) best = best === null ? value : Math.max(best, value);
+      }
+    }
+    if (best !== null) shepard(best, 0.32, 0.03);
+  }
+}
+
 function newBests() {
   const found = [];
   for (const session of state.sessions) {
@@ -300,6 +389,7 @@ function renderLegend() {
       if (hidden) state.hidden.delete(session.id);
       else state.hidden.add(session.id);
       renderLegend();
+      refreshLayouts();
       render();
     });
     item.append(button);
@@ -307,10 +397,38 @@ function renderLegend() {
   }
 }
 
+function enabledLimit() {
+  let max = 0;
+  for (const session of state.sessions) {
+    if (state.hidden.has(session.id)) continue;
+    session.experiments.forEach((experiment, index) => {
+      const scored = metricValue(experiment, "validation_auroc") !== null
+        || metricValue(experiment, "validation_auprc") !== null;
+      if (!scored) return;
+      max = Math.max(max, experimentNumber(experiment, index));
+    });
+  }
+  return max;
+}
+
+function syncLimit() {
+  state.maxStep = enabledLimit();
+  if (state.step > state.maxStep) {
+    state.step = state.maxStep;
+    stop();
+  }
+}
+
+function refreshLayouts() {
+  syncLimit();
+  state.layouts = plots.map((plot) => buildLayout(plot.metric));
+}
+
 function render() {
   plots.forEach((plot, index) => drawFrame(plot, state.layouts[index]));
   renderNote();
   progress.textContent = state.step ? `Experiment ${state.step}` : "Start";
+  if (state.recording) paintRecording();
 }
 
 function stop() {
@@ -319,12 +437,26 @@ function stop() {
 }
 
 function schedule() {
+  syncLimit();
+  if (state.maxStep < 1 || state.step >= state.maxStep) {
+    state.timer = null;
+    return;
+  }
   const wait = state.notes && newBests().length ? HOLD_MS : STEP_MS;
   state.timer = setTimeout(() => {
-    state.step += 1;
-    render();
-    if (state.step >= state.maxStep) {
+    syncLimit();
+    if (state.maxStep < 1 || state.step >= state.maxStep) {
       state.timer = null;
+      render();
+      return;
+    }
+    state.step += 1;
+    const finished = state.step >= state.maxStep;
+    render();
+    playStepSound(finished);
+    if (finished) {
+      state.timer = null;
+      if (state.recording) finishRecordingSoon();
       return;
     }
     schedule();
@@ -333,6 +465,8 @@ function schedule() {
 
 function play() {
   if (state.timer) return;
+  syncLimit();
+  if (state.maxStep < 1) return;
   if (state.step >= state.maxStep) state.step = 0;
   schedule();
 }
@@ -344,6 +478,236 @@ function restart() {
   play();
 }
 
+const query = new URLSearchParams(location.search);
+let recordGain = null;
+let recorder = null;
+let recordChunks = [];
+let recordCanvas = null;
+let recordDone = null;
+let paintGen = 0;
+let paintTask = Promise.resolve();
+
+const SVG_STYLE = ["fill", "stroke", "stroke-width", "stroke-dasharray", "stroke-linecap", "stroke-linejoin", "opacity", "font-family", "font-size", "font-weight"];
+
+function inlineSvgStyles(source, clone) {
+  const computed = getComputedStyle(source);
+  for (const prop of SVG_STYLE) {
+    const value = computed.getPropertyValue(prop);
+    if (value) clone.style.setProperty(prop, value);
+  }
+  for (let index = 0; index < source.children.length; index += 1) {
+    inlineSvgStyles(source.children[index], clone.children[index]);
+  }
+}
+
+function svgImage(svg) {
+  const clone = svg.cloneNode(true);
+  inlineSvgStyles(svg, clone);
+  clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+  clone.setAttribute("width", "800");
+  clone.setAttribute("height", "372");
+  const xml = new XMLSerializer().serializeToString(clone);
+  const url = URL.createObjectURL(new Blob([xml], { type: "image/svg+xml;charset=utf-8" }));
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("chart"));
+    };
+    image.src = url;
+  });
+}
+
+function wrapText(ctx, text, maxWidth) {
+  const words = String(text || "").replace(/\s+/g, " ").trim().split(" ");
+  const lines = [];
+  let line = "";
+  for (const word of words) {
+    const next = line ? `${line} ${word}` : word;
+    if (line && ctx.measureText(next).width > maxWidth) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = next;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function recordingTitle() {
+  const labels = [];
+  for (const session of state.sessions) {
+    if (state.hidden.has(session.id)) continue;
+    const label = modelStyle(session.model).label;
+    if (!labels.includes(label)) labels.push(label);
+  }
+  if (labels.length === 1) return labels[0];
+  return "Session playback";
+}
+
+function recordingColor() {
+  for (const session of state.sessions) {
+    if (!state.hidden.has(session.id)) return modelStyle(session.model).color;
+  }
+  return "#1f1d18";
+}
+
+function recordingFrame() {
+  const width = 1080;
+  const pad = 56;
+  const chartW = width - pad * 2;
+  const chartH = chartW * (372 / 800);
+  const noteLines = 2;
+  const noteLineH = 32;
+  const contentH = 58 + 44 + noteLines * noteLineH + 36 + chartH;
+  let height = Math.ceil(pad + contentH + pad);
+  if (height % 2) height += 1;
+  return { width, height, pad, chartW, chartH, noteLines, noteLineH };
+}
+
+function paintRecording() {
+  const gen = ++paintGen;
+  const font = getComputedStyle(document.body).fontFamily;
+  paintTask = svgImage(plots[0].svg).then((image) => {
+    if (gen !== paintGen || !recordCanvas) return;
+    const ctx = recordCanvas.getContext("2d");
+    const frame = recordingFrame();
+    const { width, height, chartW, chartH, noteLines, noteLineH } = frame;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, width, height);
+    ctx.textBaseline = "top";
+    let y = frame.pad;
+    ctx.fillStyle = recordingColor();
+    ctx.fillRect(56, y + 8, 18, 18);
+    ctx.fillStyle = "#1f1d18";
+    ctx.font = `600 34px ${font}`;
+    ctx.fillText(recordingTitle(), 88, y);
+    y += 58;
+    ctx.fillStyle = "#6f6b62";
+    ctx.font = `22px ${font}`;
+    ctx.fillText(state.step ? `EXPERIMENT ${state.step}` : "START", 56, y);
+    y += 44;
+    const bests = state.notes ? newBests() : [];
+    ctx.fillStyle = "#1f1d18";
+    ctx.font = `22px ${font}`;
+    if (bests.length) {
+      const hit = bests.reduce((best, row) => (row.score > best.score ? row : best));
+      const name = hit.experiment.title || hit.experiment.change || "";
+      const lines = wrapText(ctx, `${hit.experiment.id} · ${hit.score.toFixed(3)}   ${name}`, chartW);
+      lines.forEach((line, index) => ctx.fillText(line, 56, y + index * noteLineH));
+    }
+    y += noteLines * noteLineH + 36;
+    ctx.drawImage(image, 56, y, chartW, chartH);
+  }).catch((error) => {
+    document.documentElement.dataset.paint = String(error);
+  });
+  return paintTask;
+}
+
+function videoName() {
+  const slug = recordingTitle().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  return `${slug || "playback"}.webm`;
+}
+
+function updateRecordButton() {
+  recordButton.textContent = state.recording ? "Recording" : "Record";
+  recordButton.setAttribute("aria-pressed", state.recording ? "true" : "false");
+}
+
+function setupRecorder(ctx) {
+  const dest = ctx.createMediaStreamDestination();
+  recordGain = ctx.createGain();
+  recordGain.gain.value = 6;
+  recordGain.connect(dest);
+  recordCanvas = document.createElement("canvas");
+  const frame = recordingFrame();
+  recordCanvas.width = frame.width;
+  recordCanvas.height = frame.height;
+  const stream = recordCanvas.captureStream(30);
+  dest.stream.getAudioTracks().forEach((track) => stream.addTrack(track));
+  const types = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
+  const mime = types.find((type) => MediaRecorder.isTypeSupported(type)) || "";
+  recorder = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 6_000_000, audioBitsPerSecond: 128_000 } : undefined);
+  recordChunks = [];
+  recorder.ondataavailable = (event) => {
+    if (event.data.size) recordChunks.push(event.data);
+  };
+  recorder.onstop = () => {
+    const chunks = recordChunks;
+    const type = recorder.mimeType || "video/webm";
+    const keep = state.keepVideo;
+    state.recording = false;
+    recordGain = null;
+    updateRecordButton();
+    if (!keep || !chunks.length) return;
+    const blob = new Blob(chunks, { type });
+    if (query.has("save")) {
+      fetch("/save-video", { method: "POST", body: blob })
+        .then((response) => {
+          document.documentElement.dataset.video = response.ok ? "saved" : "error";
+        })
+        .catch(() => {
+          document.documentElement.dataset.video = "error";
+        });
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = videoName();
+    link.click();
+  };
+}
+
+function finishRecordingSoon() {
+  clearTimeout(recordDone);
+  recordDone = setTimeout(async () => {
+    await paintTask;
+    if (!state.recording || !recorder || recorder.state === "inactive") return;
+    state.keepVideo = true;
+    recorder.stop();
+  }, 800);
+}
+
+function abortRecording() {
+  clearTimeout(recordDone);
+  if (!state.recording && (!recorder || recorder.state === "inactive")) return;
+  state.keepVideo = false;
+  state.recording = false;
+  recordGain = null;
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+  updateRecordButton();
+}
+
+async function beginRecording() {
+  if (state.recording || !state.sessions.length || typeof MediaRecorder === "undefined") return;
+  stop();
+  const ctx = audio();
+  if (!ctx) return;
+  if (ctx.state !== "running") await ctx.resume();
+  state.step = 0;
+  state.recording = true;
+  state.keepVideo = true;
+  document.documentElement.dataset.video = "recording";
+  try {
+    setupRecorder(ctx);
+  } catch {
+    state.recording = false;
+    recordGain = null;
+    progress.textContent = "Recording is unavailable";
+    document.documentElement.dataset.video = "error";
+    return;
+  }
+  updateRecordButton();
+  render();
+  recorder.start(200);
+  play();
+}
+
 notesButton.addEventListener("click", () => {
   state.notes = !state.notes;
   notesButton.setAttribute("aria-pressed", state.notes ? "true" : "false");
@@ -351,9 +715,11 @@ notesButton.addEventListener("click", () => {
   render();
 });
 
-playButton.addEventListener("click", play);
-stopButton.addEventListener("click", stop);
-restartButton.addEventListener("click", restart);
+playButton.addEventListener("click", () => { audio(); play(); });
+stopButton.addEventListener("click", () => { stop(); abortRecording(); });
+restartButton.addEventListener("click", () => { abortRecording(); audio(); restart(); });
+recordButton.addEventListener("click", beginRecording);
+document.addEventListener("pointerdown", () => audio(), { once: true });
 
 fetch("./data/sessions.json")
   .then((response) => {
@@ -362,16 +728,20 @@ fetch("./data/sessions.json")
   })
   .then((data) => {
     state.sessions = data.sessions || [];
-    state.maxStep = 1;
-    state.sessions.forEach((session) => {
-      session.experiments.forEach((experiment, index) => {
-        state.maxStep = Math.max(state.maxStep, experimentNumber(experiment, index));
-      });
-    });
-    state.layouts = plots.map((plot) => buildLayout(plot.metric));
+    const only = query.get("only");
+    if (only) {
+      let test = null;
+      try { test = new RegExp(only, "i"); } catch { test = null; }
+      if (test) {
+        for (const session of state.sessions) {
+          if (!test.test(`${session.model || ""} ${session.id}`)) state.hidden.add(session.id);
+        }
+      }
+    }
+    refreshLayouts();
     renderLegend();
     render();
-    play();
+    if (!query.has("record")) play();
   })
   .catch(() => {
     progress.textContent = "Could not load sessions";
