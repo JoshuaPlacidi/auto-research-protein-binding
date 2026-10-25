@@ -4,6 +4,8 @@
 
 The immune system uses T-cell receptors (TCRs) to recognise potentially harmful cells, such as viruses and cancer. Cells display small fragments of proteins, called peptides, on their surface using molecules known as MHCs, forming peptdie-MHC (pMHC) complexes. When a TCR binds to a specific pMHC complex, it signals that the T cell has recognised its target and can trigger an immune response. Predicting which TCRs bind to which pMHC complexes is therefore a fundamental step towards understanding and harnessing the immune system.
 
+[Gemini 4 Argon session playback](./figures/gemini-4-argon-playback.mp4)
+
 ![TCR–pMHC binding cartoon](./figures/tcr_pmhc_cartoon.png)
 
 ## Why this matters
@@ -60,6 +62,9 @@ These VICReg models were trained before the autonomous search, on the same compl
 | One-hot VICReg | 0.733 ± 0.002 | 0.721 ± 0.003 | 0.721 ± 0.003 | 0.705 ± 0.004 |
 | Raw ESMC VICReg | 0.809 ± 0.004 | 0.803 ± 0.003 | 0.789 ± 0.004 | 0.787 ± 0.004 |
 
+![Validation AUROC](./figures/validation_auroc.png)
+
+![Validation AUPRC](./figures/validation_auprc.png)
 
 ## Research goal
 
@@ -87,7 +92,20 @@ This work draws on curated TCR–epitope resources including:
 - `objective.md` — the agent’s research brief
 - `experiments/` — logs, results, summaries, and progress plots
 
-Run instructions are in [how-to-run.md](how-to-run.md).
+## Run
+
+Set `GEMINI_API_KEY` or `OPENROUTER_API_KEY`, plus `TRAIN_PATH` and `VALIDATION_PATH`, in `.env`. Gemini 4 Argon is the default. `--resume` reopens the latest session.
+
+```bash
+python agent/agent.py --max-experiments 2
+python agent/agent.py --resume
+```
+
+Final evaluation reads `TEST_PATH` and then freezes that session, so a later resume cannot use the test labels.
+
+```bash
+python final_eval.py --test-path /absolute/path/to/test.csv --session SESSION --experiment-id 0001
+```
 
 ## Bottom line
 
