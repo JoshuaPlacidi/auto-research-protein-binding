@@ -166,8 +166,7 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
-# mkdocs/Zensical documentation
-/site
+# The research dashboard in /site is committed for GitHub Pages.
 
 # mypy
 .mypy_cache/

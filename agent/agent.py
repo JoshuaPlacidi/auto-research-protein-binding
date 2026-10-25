@@ -39,7 +39,7 @@ SESSION_STARTED_AT = None
 MAX_EDITS = 8
 MAX_REPAIRS = 5
 API_TIMEOUT = 600
-THINKING_LEVEL = "high"
+THINKING_LEVEL = "medium"
 HIGHLIGHT_GROUPS = (
     "unseen_tcr", "unseen_peptide", "unseen_hla", "unseen_pmhc",
     "unseen_tcr_and_pmhc", "completely_unseen_tcr_peptide_hla", "fully_seen_components",
@@ -47,7 +47,7 @@ HIGHLIGHT_GROUPS = (
 _GROUP_METRICS = ("auroc", "auprc")
 _SUMMARY_COLUMNS = (
     "session_id", "experiment_id", "timestamp", "status", "parent", "n_edits",
-    "hypothesis", "change",
+    "hypothesis", "title", "change",
     "validation_loss", "auroc", "auprc", "accuracy", "binary_log_loss",
     "peptide_macro_auroc", "peptide_macro_auprc",
     "n", "n_positive", "n_negative",
@@ -89,24 +89,58 @@ def preview_lines(text, limit=8):
     return shown
 
 
-def show_proposal(proposal):
+def short_title(value):
+    if not isinstance(value, str):
+        return None
+    words = value.split()
+    if not words:
+        return None
+    return " ".join(words[:6])
+
+
+def show_proposal(proposal, source=None):
     say(f"  parent  {proposal['parent']}")
+    title = short_title(proposal.get("title"))
+    if title:
+        say(f"  title   {title}")
     say(f"  change  {' '.join(proposal['change'].split())}")
     edits = proposal.get("edits") or []
     if not edits:
         say("  edits   none")
         return
+    if source is None:
+        try:
+            source = parent_source(proposal["parent"])
+        except (KeyError, ValueError, OSError):
+            source = None
+    lines = source.splitlines() if isinstance(source, str) else []
     say(f"  edits   {len(edits)}")
     for index, edit in enumerate(edits, 1):
-        say(f"  --- {index}")
-        for line in preview_lines(edit.get("old", "")):
-            say(f"  - {line}")
-        for line in preview_lines(edit.get("new", "")):
-            say(f"  + {line}")
+        start, end = edit.get("start"), edit.get("end")
+        say(f"  --- {index}  lines {start}-{end}")
+        if isinstance(start, int) and isinstance(end, int) and not isinstance(start, bool) and not isinstance(end, bool):
+            if 1 <= start <= end <= len(lines):
+                for line in preview_lines("\n".join(lines[start - 1:end])):
+                    say(f"  - {line}")
+        elif edit.get("old"):
+            for line in preview_lines(edit.get("old", "")):
+                say(f"  - {line}")
+        new = edit.get("new", "")
+        if new:
+            for line in preview_lines(new):
+                say(f"  + {line}")
+        else:
+            say("  + (delete)")
 
 
 def metric_text(value):
     return "—" if value is None else f"{value:.4f}"
+
+
+def trace_label(directory):
+    proposal = _last_event(read_records(directory / "log.jsonl"), "proposal") or {}
+    title = short_title(proposal.get("title"))
+    return f"{directory.name}  {title}" if title else directory.name
 
 
 def prompt_context(directory):
@@ -141,14 +175,14 @@ def show_result(experiment_id, record):
         if evaluations:
             row = evaluations[-1].get("metrics", {}).get("overall", {})
             mark = "*" if directory.name == experiment_id else " "
-            say(f"   {mark} {directory.name}  loss {metric_text(row.get('validation_loss'))}"
+            say(f"   {mark} {trace_label(directory)}  loss {metric_text(row.get('validation_loss'))}"
                 f"  auroc {metric_text(row.get('auroc'))}  auprc {metric_text(row.get('auprc'))}"
                 f"  ctx {prompt_context(directory) or '—'}")
         elif directory.name == experiment_id or any(
                 r.get("event") == "experiment_failure" for r in read_records(directory / "log.jsonl")):
             mark = "*" if directory.name == experiment_id else " "
             ctx = prompt_context(directory)
-            say(f"   {mark} {directory.name}  failed" + (f"  ctx {ctx}" if ctx else ""))
+            say(f"   {mark} {trace_label(directory)}  failed" + (f"  ctx {ctx}" if ctx else ""))
 
 
 def append_log(path, event, **fields):
@@ -297,6 +331,7 @@ def summarize_experiment(directory):
         "parent": proposal.get("parent"),
         "hypothesis": proposal.get("hypothesis"),
         "evidence": proposal.get("evidence"),
+        "title": short_title(proposal.get("title")),
         "change": proposal.get("change"),
         "n_edits": len(edits) if isinstance(edits, list) else None,
         "error": error,
@@ -340,6 +375,7 @@ def _flat_summary_row(session_id, row):
         "parent": row["parent"],
         "n_edits": row["n_edits"],
         "hypothesis": row.get("hypothesis"),
+        "title": row.get("title"),
         "change": row.get("change"),
         "validation_loss": metrics.get("validation_loss"),
         "auroc": metrics.get("auroc"),
@@ -506,18 +542,19 @@ def experiment_history(directory):
     for record in read_records(directory / "log.jsonl"):
         event = record.get("event")
         if event == "proposal":
-            for key in ("parent", "hypothesis", "change", "edits"):
+            for key in ("parent", "hypothesis", "title", "evidence", "change", "edits"):
                 if key in record:
                     entry[key] = record[key]
         elif event == "training_configuration":
             epochs = []
         elif event == "training_epoch":
-            epochs.append({key: record.get(key) for key in ("epoch", "train_loss", "validation_loss")})
+            epochs.append({key: record.get(key) for key in
+                           ("epoch", "train_loss", "validation_loss", "auroc", "auprc")})
         elif event == "repair":
-            lines = [line.strip() for line in (record.get("error") or "").splitlines() if line.strip()]
             entry.setdefault("repairs", []).append({
                 "change": record.get("change"),
-                "error": lines[-1][:240] if lines else None,
+                "error": record.get("error"),
+                "edits": record.get("edits"),
             })
         elif event == "model_evaluation":
             metrics = record.get("metrics") or {}
@@ -537,45 +574,53 @@ def experiment_history(directory):
     return entry
 
 
-def build_context(task, data_summary):
-    """Objective, source files the model may patch, and a condensed experiment history."""
-    sources = {"starter": STARTER.read_text(encoding="utf-8")}
-    history = []
-    for directory in research_dirs():
-        history.append(experiment_history(directory))
-        source = directory / "ml.py"
-        if source.is_file():
-            sources[directory.name] = source.read_text(encoding="utf-8")
-    return json.dumps({
+def build_context(task, data_summary, pending_failure=None):
+    """Objective, source files the model may patch, and a condensed experiment history.
+
+    A repair adds pending_failure: the error and the edits that just failed. Its source
+    is the only file in the prompt, including a file that was never written. Other
+    experiments stay in the history as results.
+    """
+    history = [experiment_history(directory) for directory in research_dirs()]
+    if pending_failure:
+        experiment_id = pending_failure["experiment_id"]
+        sources = {experiment_id: numbered_source(pending_failure["source"])}
+        line_source = f"sources[{experiment_id!r}]"
+    else:
+        sources = {"starter": numbered_source(STARTER.read_text(encoding="utf-8"))}
+        for directory in research_dirs():
+            source = directory / "ml.py"
+            if source.is_file():
+                sources[directory.name] = numbered_source(source.read_text(encoding="utf-8"))
+        line_source = "the parent source"
+    contract = (
+        "Respond only in the requested JSON schema. You have no shell or file tools. "
+        "The controller copies the named parent ml.py into a new experiment directory and applies edits. "
+        "parent is starter or an existing experiment id. "
+        "Each source is numbered 'N| text'; the prefix is not part of the file. "
+        f"edits is a list of {{start, end, new}}. start and end are inclusive 1-based lines in {line_source}. "
+        "new is the replacement without line-number prefixes; an empty new deletes the range. "
+        f"At most {MAX_EDITS} edits. Ranges refer to the original file and must not overlap. "
+        "An empty list copies the parent unchanged. "
+        "Do not spend an experiment only reverting a previous change. "
+        "To leave a failed line, set parent to an earlier experiment and put the new change on that source."
+    )
+    if pending_failure:
+        contract += " This is a repair. Change only the lines needed to fix the error. Leave the rest of the file unchanged."
+    payload = {
         "task": task,
         "objective": (ROOT / "objective.md").read_text(encoding="utf-8"),
         "sources": sources,
         "history": history,
         "data_summary": prompt_data_summary(data_summary),
-        "controller_contract": (
-            "Respond only in the requested JSON schema. You have no shell or file tools. "
-            "The controller copies the named parent ml.py into a new experiment directory and applies edits. "
-            "parent is starter or an existing experiment id. edits is an ordered list of {old, new} strings; "
-            "each old must occur exactly once in the parent file; at most 8 edits; an empty list copies the parent unchanged. "
-            f"If that run fails because of the code, you can repair the same file up to {MAX_REPAIRS} times. "
-            f"After repair {MAX_REPAIRS} the experiment is abandoned. "
-            "Do not change evaluator/data/dependencies/controller, access test data, "
-            "or make API/network calls from ml.py. "
-            "Keep Dataset.data in original CSV order; select eligible full-chain rows with Subset for training. "
-            "Validate chain boundaries and use complete untruncated alpha+beta, peptide and HLA sequences. "
-            "Maintain Model(), Dataset(path), main(), and forward(peptide,hla,tcr) interfaces. "
-            "main() must use the module EXPERIMENT_DIR, set by the controller, and save model.pth there. "
-            "Seed Python, numpy and torch; record actual hyperparameters and epoch metrics. "
-            "Append aggregate-only training events to RESEARCH_LOG_PATH. Never print/log raw rows, "
-            "patient information, sequence tables, secrets, or create training.log/summary/plot files. "
-            "CPU/GPU use must respect the operator's environment and scheduler allocation. "
-            "Base the next parent choice on all reported metrics and full history, not solely the lowest MSE. "
-            "No training occurs during imports. No package installs or subprocess launches in generated ml.py. "
-            "Preserve checkpoint saving: initial_model.pth after initialisation, last_model.pth every epoch "
-            "and in a finally block, model.pth for the chosen validation checkpoint. Save atomically. "
-            "Never delete or overwrite another experiment directory or checkpoint."
-        ),
-    }, ensure_ascii=False)
+        "controller_contract": contract,
+    }
+    if pending_failure:
+        payload["pending_failure"] = {
+            key: pending_failure[key]
+            for key in ("experiment_id", "attempt", "error", "intended", "attempted_edits")
+        }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 class ArgonClient:
@@ -622,9 +667,15 @@ class ArgonClient:
                    context_sha256=source_hash(prompt), api_calls_used=self.calls,
                    thinking_level=THINKING_LEVEL if self.provider == "gemini" else None,
                    max_output_tokens=self.args.max_output_tokens)
-        text, finishes, token_usage = self._generate(prompt, schema, phase)
+        started = time.monotonic()
+        try:
+            text, finishes, token_usage = self._generate(prompt, schema, phase)
+        finally:
+            elapsed = time.monotonic() - started
+            say(f"  response  {elapsed:.1f}s")
         append_log(log_path, "api_response", experiment_id=experiment_id, phase=phase, provider=self.provider,
-                   finish_reasons=finishes, token_usage=token_usage, response_text=text)
+                   finish_reasons=finishes, token_usage=token_usage, response_text=text,
+                   response_seconds=round(elapsed, 1))
         who = "Argon" if self.provider == "gemini" else "OpenRouter"
         if self._output_truncated(finishes):
             raise ValueError(f"{who} reached its thinking/output cap; no partial model code will be applied")
@@ -762,13 +813,22 @@ class ArgonClient:
         return any("MAX_TOKENS" in reason or reason.lower() == "length" for reason in finishes)
 
 
+EDIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "start": {"type": "integer", "description": "First line to replace, 1-based, inclusive."},
+        "end": {"type": "integer", "description": "Last line to replace, 1-based, inclusive."},
+        "new": {"type": "string", "description": "Replacement text without line-number prefixes. Empty deletes the range."},
+    },
+    "required": ["start", "end", "new"],
+}
+
+
 REPAIR_SCHEMA = {
     "type": "object",
     "properties": {
         "change": {"type": "string"},
-        "edits": {"type": "array", "items": {"type": "object", "properties": {
-            "old": {"type": "string"}, "new": {"type": "string"}},
-            "required": ["old", "new"]}},
+        "edits": {"type": "array", "items": EDIT_SCHEMA},
     },
     "required": ["change", "edits"],
 }
@@ -780,12 +840,11 @@ PROPOSAL_SCHEMA = {
         "parent": {"type": "string"},
         "hypothesis": {"type": "string"},
         "evidence": {"type": "string"},
+        "title": {"type": "string", "description": "At most six words. A high-level name for this change, not a description."},
         "change": {"type": "string"},
-        "edits": {"type": "array", "items": {"type": "object", "properties": {
-            "old": {"type": "string"}, "new": {"type": "string"}},
-            "required": ["old", "new"]}},
+        "edits": {"type": "array", "items": EDIT_SCHEMA},
     },
-    "required": ["parent", "hypothesis", "evidence", "change", "edits"],
+    "required": ["parent", "hypothesis", "evidence", "title", "change", "edits"],
 }
 
 
@@ -804,18 +863,76 @@ def parent_source(parent):
     return path.read_text(encoding="utf-8")
 
 
+def numbered_source(text):
+    """Prompt view of a file. The 'N| ' prefix is not part of the source the controller patches."""
+    lines = text.splitlines()
+    width = len(str(len(lines) or 1))
+    return "\n".join(f"{number:>{width}}| {line}" for number, line in enumerate(lines, 1))
+
+
+def line_number(value, index, name):
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Edit {index}: {name} must be a line number")
+    return value
+
+
+def replacement_lines(new):
+    if new == "":
+        return []
+    parts = new.split("\n")
+    if parts[-1] == "":
+        parts.pop()
+    return parts
+
+
+def range_error(index, start, end, lines):
+    count = len(lines)
+    if count == 0:
+        return f"Edit {index}: lines {start}-{end} are outside an empty file"
+    if start > count:
+        lo, hi = max(1, count - 4), count
+    else:
+        lo = max(1, min(start, count) - 2)
+        hi = min(count, max(end if end >= start else start, lo) + 2)
+    shown = "\n".join(f"{number}| {lines[number - 1]}" for number in range(lo, hi + 1))
+    return f"Edit {index}: lines {start}-{end} are outside 1-{count}. Nearby lines:\n{shown}"
+
+
 def apply_edits(source, edits):
+    """Replace inclusive 1-based line ranges. Ranges refer to the original file."""
     if not isinstance(edits, list):
         raise ValueError("edits must be a list")
     if len(edits) > MAX_EDITS:
         raise ValueError(f"At most {MAX_EDITS} edits")
+    lines = source.splitlines()
+    parsed = []
     for index, edit in enumerate(edits):
-        if not isinstance(edit, dict) or not isinstance(edit.get("old"), str) or not isinstance(edit.get("new"), str):
-            raise ValueError(f"Edit {index} must have old and new strings")
-        if source.count(edit["old"]) != 1:
-            raise ValueError(f"Edit {index}: old must occur exactly once")
-        source = source.replace(edit["old"], edit["new"], 1)
-    return source
+        if not isinstance(edit, dict):
+            raise ValueError(f"Edit {index} must have start, end, and new")
+        if "old" in edit and ("start" not in edit or "end" not in edit):
+            raise ValueError(f"Edit {index}: use start, end, and new line numbers, not old/new")
+        if not isinstance(edit.get("new"), str) or "start" not in edit or "end" not in edit:
+            raise ValueError(f"Edit {index} must have start, end, and new")
+        start = line_number(edit.get("start"), index, "start")
+        end = line_number(edit.get("end"), index, "end")
+        if start < 1 or end > len(lines) or start > end:
+            raise ValueError(range_error(index, start, end, lines))
+        parsed.append((start, end, edit["new"], index))
+    parsed.sort(key=lambda item: item[0])
+    for (start, end, _, index), (next_start, next_end, _, next_index) in zip(parsed, parsed[1:]):
+        if end >= next_start:
+            raise ValueError(
+                f"Edit {index}: lines {start}-{end} overlap edit {next_index} lines {next_start}-{next_end}")
+    for start, end, new, _ in reversed(parsed):
+        lines[start - 1:end] = replacement_lines(new)
+    text = "\n".join(lines)
+    if source.endswith("\n"):
+        text += "\n"
+    return text
 
 
 def write_experiment_source(directory, source):
@@ -828,42 +945,92 @@ def write_experiment_source(directory, source):
     (directory / "ml.py").write_text(source, encoding="utf-8")
 
 
+def numbered_window(source, line, radius=2):
+    lines = source.splitlines()
+    if not isinstance(line, int) or not 1 <= line <= len(lines):
+        return ""
+    numbered = numbered_source(source).splitlines()
+    lo, hi = max(1, line - radius), min(len(lines), line + radius)
+    return "\n".join(numbered[lo - 1:hi])
+
+
+def syntax_hint(exc, source):
+    """The parse error plus the lines it refers to. str(SyntaxError) omits them."""
+    shown = numbered_window(source, getattr(exc, "lineno", None))
+    if not shown:
+        return str(exc)
+    return f"{exc.msg} (ml.py, line {exc.lineno})\n{shown}"
+
+
+def last_error_line(error, source):
+    """Last traceback line number that falls inside source."""
+    count = len(source.splitlines())
+    found = None
+    start = 0
+    while True:
+        index = error.find("line ", start)
+        if index < 0:
+            return found
+        digits = []
+        for char in error[index + 5:]:
+            if char.isdigit():
+                digits.append(char)
+            else:
+                break
+        if digits:
+            number = int("".join(digits))
+            if 1 <= number <= count:
+                found = number
+        start = index + 5
+
+
 def propose_experiment(client, data_summary, experiment_id, log_path):
-    say("  planning the next change")
     available = ["starter", *[path.name for path in experiment_dirs()]]
     if len(available) == 1:
-        task = ("Establish a valid baseline from the starter ml.py. Set parent to starter. "
-                "Use an empty edits list unless you must correct full-chain filtering/padding, "
-                "seeding, shared logging or output-interface issues.")
-    else:
-        task = ("Propose one main idea based on the complete history. "
-                "The idea may be a large replacement or a small adjustment. "
-                "Try to test that one idea, rather than bundling several independent changes into the same experiment. "
-                "Set parent to starter or an existing experiment id. Return search-replace edits.")
-    task += f" Experiment ID: {experiment_id}. Available parents: {available}."
+        say("  recording the starter")
+        return {
+            "parent": "starter",
+            "title": "Unchanged starter baseline",
+            "hypothesis": "The starter ml.py is a valid sequence-only baseline before any experimental change.",
+            "evidence": "No prior experiments in this session.",
+            "change": "Copy the starter ml.py unchanged.",
+            "edits": [],
+        }
+    say("  planning the next change")
+    task = f"Experiment ID: {experiment_id}. Available parents: {available}."
     proposal = client.ask(build_context(task, data_summary), PROPOSAL_SCHEMA,
                           "proposal", experiment_id, log_path)
-    require_strings(proposal, ["parent", "hypothesis", "evidence", "change"])
+    require_strings(proposal, ["parent", "hypothesis", "evidence", "title", "change"])
     proposal["parent"] = proposal["parent"].strip()
+    proposal["title"] = short_title(proposal["title"])
     return proposal
 
 
-def materialize_experiment(directory, proposal):
-    source = apply_edits(parent_source(proposal["parent"]), proposal.get("edits"))
-    write_experiment_source(directory, source)
-    return source
-
-
-def propose_repair(client, experiment_id, log_path, source, error, attempt):
+def propose_repair(client, data_summary, experiment_id, log_path, source, error, attempt, proposal, attempted_edits):
     task = (
-        f"Repair {attempt} of {MAX_REPAIRS}. "
-        "The current ml.py failed before a valid evaluation. "
-        "Return search-replace edits that fix this failure and keep the experiment's intended change. "
-        "A failed repair uses one of the remaining attempts, and the experiment is abandoned after the last one.\n\n"
-        f"Error:\n{error}\n\n"
-        f"ml.py:\n{source}"
+        f"Repair {attempt} of {MAX_REPAIRS} for experiment {experiment_id}. "
+        f"start and end are lines in sources[{experiment_id!r}]. "
+        "Change only the lines needed to fix this error. Leave the rest of the file unchanged."
     )
-    repair = client.ask(task, REPAIR_SCHEMA, "repair", experiment_id, log_path)
+    window = numbered_window(source, last_error_line(error or "", source), radius=3)
+    if window:
+        task += f"\n\nLines around the error:\n{window}"
+    task += f"\n\n{error}"
+    pending_failure = {
+        "experiment_id": experiment_id,
+        "attempt": attempt,
+        "source": source,
+        "error": error,
+        "attempted_edits": attempted_edits or [],
+        "intended": {
+            "parent": proposal.get("parent"),
+            "hypothesis": proposal.get("hypothesis"),
+            "evidence": proposal.get("evidence"),
+            "change": proposal.get("change"),
+        },
+    }
+    repair = client.ask(build_context(task, data_summary, pending_failure), REPAIR_SCHEMA,
+                        "repair", experiment_id, log_path)
     require_strings(repair, ["change"])
     if not repair.get("edits"):
         raise ValueError("Repair returned no edits")
@@ -999,24 +1166,30 @@ def open_session(args, protocol):
     return directory, False
 
 
-def run_experiment(client, directory, proposal, args, log_path, protected):
+def run_experiment(client, directory, proposal, args, log_path, protected, data_summary):
     """Train and evaluate. A code failure gets up to MAX_REPAIRS edits of this same file."""
     experiment_id = directory.name
     last_error = None
+    attempted_edits = proposal.get("edits") or []
+    source = None
     for attempt in range(MAX_REPAIRS + 1):
         try:
             if attempt:
                 say(f"  repair  {attempt}/{MAX_REPAIRS}")
-                source = ((directory / "ml.py").read_text(encoding="utf-8")
-                          if (directory / "ml.py").is_file() else parent_source(proposal["parent"]))
-                repair = propose_repair(client, experiment_id, log_path, source, last_error, attempt)
-                show_proposal({"parent": experiment_id, "change": repair["change"], "edits": repair.get("edits")})
-                source = apply_edits(source, repair.get("edits"))
+                if source is None:
+                    source = ((directory / "ml.py").read_text(encoding="utf-8")
+                              if (directory / "ml.py").is_file() else parent_source(proposal["parent"]))
+                repair = propose_repair(client, data_summary, experiment_id, log_path, source,
+                                        last_error, attempt, proposal, attempted_edits)
+                show_proposal({"parent": experiment_id, "change": repair["change"], "edits": repair.get("edits")}, source)
+                attempted_edits = repair.get("edits") or []
+                source = apply_edits(source, attempted_edits)
                 write_experiment_source(directory, source)
                 append_log(log_path, "repair", experiment_id=experiment_id, attempt=attempt,
                            error=last_error, ml_sha256=source_hash(source), **repair)
             else:
-                source = materialize_experiment(directory, proposal)
+                source = apply_edits(parent_source(proposal["parent"]), proposal.get("edits"))
+                write_experiment_source(directory, source)
                 append_log(log_path, "proposal", experiment_id=experiment_id,
                            ml_sha256=source_hash(source), **proposal)
             run_training(experiment_id, directory, args, log_path)
@@ -1029,7 +1202,7 @@ def run_experiment(client, directory, proposal, args, log_path, protected):
         except Exception as exc:
             if str(exc).startswith("Protected input changed"):
                 raise
-            last_error = str(exc)
+            last_error = syntax_hint(exc, source) if isinstance(exc, SyntaxError) and source else str(exc)
             if len(last_error) > 4000:
                 last_error = last_error[-4000:]
             lines = last_error.splitlines() or [last_error]
@@ -1077,7 +1250,7 @@ def _run_agent_loop(args, client_factory=ArgonClient):
             try:
                 proposal = propose_experiment(client, data_summary, experiment_id, log_path)
                 show_proposal(proposal)
-                record = run_experiment(client, directory, proposal, args, log_path, protected)
+                record = run_experiment(client, directory, proposal, args, log_path, protected, data_summary)
                 if record:
                     latest = directory
                     show_result(experiment_id, record)

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TCR–pMHC research sessions</title>
+  <meta name="description" content="Validation AUROC from autonomous TCR–pMHC binding experiments.">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header>
+    <p class="kicker">Autonomous research</p>
+    <h1>TCR–pMHC binding</h1>
+    <ul class="legend" id="legend" aria-label="Models"></ul>
+  </header>
+
+  <figure class="chart">
+    <svg id="chart" viewBox="0 0 800 372" role="img" aria-label="Validation AUROC by experiment"></svg>
+    <div id="chart-tooltip" class="chart-tooltip" hidden></div>
+  </figure>
+
+  <figure class="chart">
+    <svg id="auprc" viewBox="0 0 800 372" role="img" aria-label="Validation AUPRC by experiment"></svg>
+    <div id="auprc-tooltip" class="chart-tooltip" hidden></div>
+  </figure>
+
+  <nav aria-label="Sessions">
+    <div class="nav-head">
+      <p class="kicker">Sessions</p>
+      <button type="button" id="show-all" class="text-btn">All</button>
+    </div>
+    <ol id="sessions"></ol>
+  </nav>
+
+  <section id="detail" aria-live="polite">
+    <p class="placeholder">Click a point on the chart.</p>
+  </section>
+
+  <script src="./app.js"></script>
+</body>
+</html>
