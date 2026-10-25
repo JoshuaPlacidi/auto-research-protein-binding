@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session playback</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧬</text></svg>">
+  <meta name="description" content="Playback of validation AUROC and AUPRC as each research session proceeds.">
+  <link rel="stylesheet" href="./style.css?v=8">
+</head>
+<body>
+  <header>
+    <p class="kicker"><a href="./">All sessions</a></p>
+    <h1>Session playback</h1>
+    <ul class="legend" id="legend" aria-label="Models"></ul>
+    <div class="demo-controls">
+      <button type="button" id="play" class="text-btn">Play</button>
+      <button type="button" id="stop" class="text-btn">Stop</button>
+      <button type="button" id="restart" class="text-btn">Restart</button>
+      <button type="button" id="notes" class="text-btn" aria-pressed="true">Notes</button>
+      <p id="progress"></p>
+    </div>
+  </header>
+
+  <figure class="chart">
+    <svg id="chart" viewBox="0 0 800 372" role="img" aria-label="Validation AUROC by experiment"></svg>
+  </figure>
+
+  <figure class="chart">
+    <svg id="auprc" viewBox="0 0 800 372" role="img" aria-label="Validation AUPRC by experiment"></svg>
+  </figure>
+
+  <script src="./demo.js?v=9"></script>
+</body>
+</html>
