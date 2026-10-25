@@ -26,6 +26,10 @@ body {
   padding: 3.25rem 1.25rem 5rem;
 }
 
+a {
+  color: inherit;
+}
+
 h1 {
   font-size: 1.45rem;
   font-weight: 600;
