@@ -60,7 +60,6 @@ These VICReg models were trained before the autonomous search, on the same compl
 | One-hot VICReg | 0.733 ± 0.002 | 0.721 ± 0.003 | 0.721 ± 0.003 | 0.705 ± 0.004 |
 | Raw ESMC VICReg | 0.809 ± 0.004 | 0.803 ± 0.003 | 0.789 ± 0.004 | 0.787 ± 0.004 |
 
-![Sequence baselines](./figures/sequence_baseline_aucs.png)
 
 ## Research goal
 
