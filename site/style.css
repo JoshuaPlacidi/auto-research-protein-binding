@@ -93,6 +93,13 @@ h1 {
   text-transform: uppercase;
 }
 
+.results .panel .hint {
+  font-weight: 400;
+  letter-spacing: 0;
+  margin-left: 0.7rem;
+  text-transform: none;
+}
+
 .results .model .swatch {
   background: currentColor;
   border: 1px solid transparent;

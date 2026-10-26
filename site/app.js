@@ -490,6 +490,9 @@ fetch("./data/sessions.json")
   })
   .then((data) => {
     state.data = data;
+    for (const session of data.sessions || []) {
+      if (!/argon/.test(String(session.model || "").toLowerCase())) state.hidden.add(session.id);
+    }
     renderSessions();
     renderPlots();
     renderDetail();
